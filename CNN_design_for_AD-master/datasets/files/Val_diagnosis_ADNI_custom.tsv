@@ -1,0 +1,11 @@
+participant_id	session_id	diagnosis	mmse	cdr	cdr_sb	age	examination_date	earliest_time	age_rounded	filepath	original_subject
+sub-ADNI014S0548	ses-M00	CN	29.0	0.0	0.0	73.6	2024-01-01	2024-01-01	73.5	/Users/othree/Cognitive Reserve Modeling/Data/ADNI_Download 4/cropped_014_S_0548_2006-05-25_S14921_I39665_orig-in-mni305.nii.gz	014_S_0548
+sub-ADNI014S0519	ses-M00	CN	30.0	0.0	0.0	74.1	2024-01-01	2024-01-01	74.0	/Users/othree/Cognitive Reserve Modeling/Data/ADNI_Download 4/cropped_014_S_0519_2006-12-07_S23614_I40863_orig-in-mni305.nii.gz	014_S_0519
+sub-ADNI041S0262	ses-M00	CN	28.0	0.0	0.0	85.8	2024-01-01	2024-01-01	86.0	/Users/othree/Cognitive Reserve Modeling/Data/ADNI_Download/cropped_041_S_0262_2007-01-02_S24586_I83108_orig-in-mni305.nii.gz	041_S_0262
+sub-ADNI116S0361	ses-M00	MCI	25.0	0.0	0.0	74.5	2024-01-01	2024-01-01	74.5	/Users/othree/Cognitive Reserve Modeling/Data/ADNI_Download 3/cropped_116_S_0361_2007-11-01_S42153_I82612_orig-in-mni305.nii.gz	116_S_0361
+sub-ADNI007S0128	ses-M00	MCI	29.0	0.0	0.0	64.1	2024-01-01	2024-01-01	64.0	/Users/othree/Cognitive Reserve Modeling/Data/ADNI_Download 7/cropped_007_S_0128_2007-02-15_S26556_I59863_orig-in-mni305.nii.gz	007_S_0128
+sub-ADNI099S0551	ses-M00	MCI	29.0	0.0	0.0	64.2	2024-01-01	2024-01-01	64.0	/Users/othree/Cognitive Reserve Modeling/Data/ADNI_Download 3/cropped_099_S_0551_2006-05-18_S14645_I34586_orig-in-mni305.nii.gz	099_S_0551
+sub-ADNI941S1202	ses-M00	MCI	30.0	0.0	0.0	77.5	2024-01-01	2024-01-01	77.5	/Users/othree/Cognitive Reserve Modeling/Data/ADNI_Download 6/cropped_941_S_1202_2009-02-17_S63253_I137298_orig-in-mni305.nii.gz	941_S_1202
+sub-ADNI014S0658	ses-M00	AD	30.0	0.0	0.0	72.1	2024-01-01	2024-01-01	72.0	/Users/othree/Cognitive Reserve Modeling/Data/ADNI_Download 4/cropped_014_S_0658_2007-07-30_S36601_I73041_orig-in-mni305.nii.gz	014_S_0658
+sub-ADNI062S0793	ses-M00	AD	23.0	0.0	0.0	68.9	2024-01-01	2024-01-01	69.0	/Users/othree/Cognitive Reserve Modeling/Data/ADNI_Download 2/cropped_062_S_0793_2007-02-27_S27205_I50533_orig-in-mni305.nii.gz	062_S_0793
+sub-ADNI035S0204	ses-M00	AD	27.0	0.0	0.0	71.1	2024-01-01	2024-01-01	71.0	/Users/othree/Cognitive Reserve Modeling/Data/ADNI_Download/cropped_035_S_0204_2008-03-06_S46711_I99196_orig-in-mni305.nii.gz	035_S_0204

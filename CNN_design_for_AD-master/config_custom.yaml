@@ -1,0 +1,44 @@
+file_name: ./saved_model/custom_50subjects
+data:
+  data_root_dir: /Users/othree/Cognitive Reserve Modeling/Data/
+  dir_to_scans: /Users/othree/Cognitive Reserve Modeling/Data/ADNI_Download
+  dir_to_tsv: ./datasets/files
+  batch_size: 2
+  val_batch_size: 1
+  workers: 0
+  percentage_usage: 1.0
+exp_name: custom_50subjects
+visdom:
+  port: 8064
+  server: null
+model:
+  arch: ours
+  input_channel: 1
+  nhid: 512
+  feature_dim: 1024
+  n_label: 3
+  expansion: 8
+  num_blocks: 0
+  type_name: conv3x3x3
+  norm_type: Instance
+adv_model:
+  nhid: 36
+  out_dim: 12
+mmse_model:
+  nhid: 64
+training_parameters:
+  use_age: False
+  pretrain:
+  max_iter: 16000
+  start_epoch: 0
+  epochs: 50
+  print_freq: 5
+  max_grad_l2_norm:
+  report_interval: 50
+  snapshot_interval: 500
+
+optimizer:
+  method: SGD
+  par:
+    lr: 0.01
+    weight_decay: 0.000

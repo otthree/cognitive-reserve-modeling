@@ -1,0 +1,15 @@
+  # OS                                                                               
+  .DS_Store                                                                        
+                                                                                     
+  # Python                                                                         
+  __pycache__/                                                                       
+  *.pyc                                                                              
+                                                                                     
+  # Model checkpoints (each ~346MB)                                                  
+  saved_model/                                                                       
+                                                                                     
+  # Jupyter                                                                          
+  .ipynb_checkpoints/                                                                
+
+  # Data
+  Data/
