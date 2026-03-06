@@ -25,6 +25,7 @@ build/
 *.ipynb_checkpoints
 
 *.pth
+*.pth.tar
 *.pt
 *.ckpt
 *.h5
