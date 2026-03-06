@@ -25,7 +25,6 @@ build/
 *.ipynb_checkpoints
 
 *.pth
-*.pth.tar
 *.pt
 *.ckpt
 *.h5
@@ -39,3 +38,4 @@ wandb/
 .DS_Store
 .AppleDouble
 .LSOverride
+*.pth.tar
