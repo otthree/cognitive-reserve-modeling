@@ -1,0 +1,50 @@
+name: Functional Tests
+permissions:
+  contents: read
+
+on:
+  push:
+    branches: [ main, master, dev ]
+  pull_request:
+    branches: [ main, master, dev ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    name: Functional Tests
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v4
+      with:
+        python-version: "3.11"
+
+    - name: Install uv
+      uses: astral-sh/setup-uv@v3
+      with:
+        version: "latest"
+
+    - name: Install dependencies
+      run: |
+        uv sync --extra dev
+
+    - name: Run import tests
+      run: |
+        uv run pytest tests/test_imports.py -v --tb=short
+
+    - name: Run config tests
+      run: |
+        uv run pytest tests/config/ -v --tb=short
+
+    - name: Run ADNI base dataset tests
+      run: |
+        uv run pytest tests/test_adni_base_dataset.py -v --tb=short
+
+    - name: Generate coverage report
+      if: success()
+      env:
+        PYTORCH_DISABLE_DOCSTRING_CHECK: 1
+      run: |
+        uv run pytest tests/config/ tests/test_imports.py tests/test_adni_base_dataset.py --cov=adni_classification.config --cov=adni_classification.datasets --cov=adni_classification --cov-report=term-missing --tb=short

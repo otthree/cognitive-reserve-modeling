@@ -1,0 +1,149 @@
+"""Model factory for ADNI classification."""
+
+import os
+from typing import Any, Dict, Type
+
+from adni_classification.models.base_model import BaseModel
+from adni_classification.models.densenet3d import DenseNet3D
+from adni_classification.models.resnet3d import ResNet3D
+from adni_classification.models.rosanna_cnn import RosannaCNN
+from adni_classification.models.rosanna_cnn_gn import RosannaCNNGN
+from adni_classification.models.securefed_cnn import SecureFedCNN
+from adni_classification.models.simple_cnn import Simple3DCNN
+
+
+class ModelFactory:
+    """Factory class for creating model instances."""
+
+    _models: Dict[str, Type[BaseModel]] = {
+        "resnet3d": ResNet3D,
+        "densenet3d": DenseNet3D,
+        "simple3dcnn": Simple3DCNN,
+        "securefed_cnn": SecureFedCNN,
+        "pretrained_cnn": RosannaCNN,
+        "rosanna_cnn": RosannaCNN,
+        "rosanna_cnn_gn": RosannaCNNGN,
+    }
+
+    @classmethod
+    def create_model(cls, model_name: str, **kwargs: Any) -> BaseModel:
+        """Create a model instance.
+
+        Args:
+            model_name: Name of the model to create
+            **kwargs: Additional arguments to pass to the model constructor
+
+        Returns:
+            Model instance
+
+        Raises:
+            ValueError: If model_name is not supported
+        """
+        if model_name not in cls._models:
+            raise ValueError(f"Model {model_name} not supported. Available models: {list(cls._models.keys())}")
+
+        # Extract input_size from kwargs if specified in config for SecureFedCNN
+        if model_name == "securefed_cnn":
+            # Extract data config information if needed
+            data_config = None
+            if "data" in kwargs:
+                data_config = kwargs.pop("data")
+
+            # Get classification_mode from data config and pass it to the model
+            if data_config and "classification_mode" in data_config:
+                classification_mode = data_config["classification_mode"]
+                kwargs["classification_mode"] = classification_mode
+                print(f"Using classification_mode '{classification_mode}' from data config")
+            else:
+                classification_mode = kwargs.get("classification_mode", "CN_MCI_AD")
+
+            # If num_classes is explicitly set in the model config, respect that value
+            # Otherwise, derive it from the classification mode
+            if "num_classes" not in kwargs:
+                if classification_mode == "CN_AD":
+                    kwargs["num_classes"] = 2
+                    print(f"Setting num_classes=2 for classification_mode={classification_mode}")
+                else:
+                    kwargs["num_classes"] = 3
+                    print(f"Setting num_classes=3 for classification_mode={classification_mode}")
+
+            if "input_size" not in kwargs:
+                # Try to get resize_size from data config
+                if data_config and "resize_size" in data_config:
+                    resize_size = data_config["resize_size"]
+                    print(f"Using resize_size {resize_size} from config as input_size for SecureFedCNN")
+
+                    # Convert list to proper format if needed
+                    if isinstance(resize_size, (list, tuple)):
+                        input_size = [int(x) for x in resize_size]
+                    else:
+                        input_size = resize_size
+
+                    # Add input_size to kwargs
+                    kwargs["input_size"] = input_size
+            else:
+                print(f"Using provided input_size {kwargs['input_size']} for SecureFedCNN")
+
+        # Handle RosannaCNN and RosannaCNNGN specific configurations
+        elif model_name in ["rosanna_cnn", "pretrained_cnn", "rosanna_cnn_gn"]:
+            # Extract data config information if needed
+            data_config = None
+            if "data" in kwargs:
+                data_config = kwargs.pop("data")
+
+            # Get classification_mode from data config and set num_classes
+            if data_config and "classification_mode" in data_config:
+                classification_mode = data_config["classification_mode"]
+                if "num_classes" not in kwargs:
+                    if classification_mode == "CN_AD":
+                        kwargs["num_classes"] = 2
+                        print(f"Setting num_classes=2 for classification_mode={classification_mode}")
+                    else:
+                        kwargs["num_classes"] = 3
+                        print(f"Setting num_classes=3 for classification_mode={classification_mode}")
+
+            # Get input_size from data config if available
+            if data_config and "resize_size" in data_config:
+                # Use resize_size directly - dimension order doesn't matter for RosannaCNN
+                input_size = data_config["resize_size"]
+                kwargs["input_size"] = tuple(input_size)
+                print(f"Using resize_size from data config: {input_size}")
+            else:
+                # Default fallback
+                default_input_size = (73, 96, 96)
+                kwargs["input_size"] = default_input_size
+                print(f"No resize_size found in data config, using default input_size {default_input_size} for {model_name}")
+
+            # Handle pretrained checkpoint parameter
+            if "pretrained_checkpoint" in kwargs:
+                pretrained_checkpoint = kwargs["pretrained_checkpoint"]
+                if pretrained_checkpoint and not os.path.isabs(pretrained_checkpoint):
+                    # Make path relative to project root
+                    kwargs["pretrained_checkpoint"] = os.path.join(os.getcwd(), pretrained_checkpoint)
+                    print(f"Using pretrained checkpoint from: {kwargs['pretrained_checkpoint']}")
+                elif pretrained_checkpoint:
+                    print(f"Using pretrained checkpoint from: {pretrained_checkpoint}")
+
+            # For GroupNorm model, set default num_groups if not specified
+            if model_name == "rosanna_cnn_gn" and "num_groups" not in kwargs:
+                kwargs["num_groups"] = 32  # Default to 32 groups
+                print(f"Setting default num_groups=32 for RosannaCNNGN")
+
+            # Create the model
+            model_class = cls._models[model_name]
+            model = model_class(**kwargs)
+            print(f"Created {model_class.__name__} with input_size={kwargs['input_size']}, feature_size={model.feature_size}")
+            return model
+
+        # For other models, create as usual
+        return cls._models[model_name](**kwargs)
+
+    @classmethod
+    def register_model(cls, name: str, model_class: Type[BaseModel]) -> None:
+        """Register a new model class.
+
+        Args:
+            name: Name of the model
+            model_class: Model class to register
+        """
+        cls._models[name] = model_class

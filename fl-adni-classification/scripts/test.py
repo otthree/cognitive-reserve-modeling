@@ -1,0 +1,1822 @@
+"""Evaluation script for ADNI classification models."""
+
+import argparse
+import gc
+import json
+import os
+import time
+from datetime import datetime
+from typing import Any, Dict, List, Optional, Tuple
+
+import pandas as pd
+
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+import torch.nn as nn
+from sklearn.metrics import (
+    accuracy_score,
+    classification_report,
+    confusion_matrix,
+    precision_recall_fscore_support,
+    roc_auc_score,
+    roc_curve,
+)
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+
+from adni_classification.datasets.dataset_factory import create_adni_dataset
+from adni_classification.models.model_factory import ModelFactory
+from adni_classification.utils.visualization import plot_confusion_matrix, visualize_predictions
+
+
+def detect_model_name_from_checkpoint(checkpoint_path: str) -> str:
+    """Detect model name from checkpoint path or filename.
+
+    Args:
+        checkpoint_path: Path to the checkpoint file
+
+    Returns:
+        Detected model name
+    """
+    # Extract filename and directory
+    checkpoint_filename = os.path.basename(checkpoint_path)
+    checkpoint_dir = os.path.dirname(checkpoint_path)
+
+    # Common model name patterns in filenames
+    filename_lower = checkpoint_filename.lower()
+
+    if "rosanna" in filename_lower or "pretrained_cnn" in filename_lower:
+        return "rosanna_cnn"
+    elif "securefed" in filename_lower:
+        return "securefed_cnn"
+    elif "resnet" in filename_lower:
+        return "resnet3d"
+    elif "densenet" in filename_lower:
+        return "densenet3d"
+    elif "simple" in filename_lower:
+        return "simple3dcnn"
+
+    # Check directory name for patterns
+    dir_name_lower = checkpoint_dir.lower()
+    if "rosanna" in dir_name_lower:
+        return "rosanna_cnn"
+    elif "securefed" in dir_name_lower:
+        return "securefed_cnn"
+    elif "resnet" in dir_name_lower:
+        return "resnet3d"
+    elif "densenet" in dir_name_lower:
+        return "densenet3d"
+
+    # Default fallback
+    print(f"Warning: Could not auto-detect model name from {checkpoint_path}")
+    print("Please specify --model_name explicitly")
+    print("Defaulting to 'resnet3d'")
+    return "resnet3d"
+
+
+def create_automatic_output_dir(checkpoint_paths: List[str], base_dir: str = "evaluation_results") -> str:
+    """Create automatic output directory for multiple checkpoints evaluation.
+
+    Args:
+        checkpoint_paths: List of checkpoint file paths
+        base_dir: Base directory for outputs
+
+    Returns:
+        Generated output directory path
+    """
+    if len(checkpoint_paths) == 1:
+        # Single checkpoint - use existing logic
+        checkpoint_path = checkpoint_paths[0]
+        # Extract the experiment directory name - handle both old and new formats
+        checkpoint_dir = os.path.dirname(checkpoint_path)
+        checkpoint_dir_name = os.path.basename(checkpoint_dir)
+
+        # Check if checkpoint is in a "checkpoints" subdirectory (new format)
+        if checkpoint_dir_name == "checkpoints":
+            # New format: outputs/experiment-name/checkpoints/checkpoint.pt
+            experiment_dir = os.path.dirname(checkpoint_dir)
+            parent_dir_name = os.path.basename(experiment_dir)
+        else:
+            # Old format: outputs_centralized/experiment-name/checkpoint.pth
+            parent_dir_name = checkpoint_dir_name
+
+        # Extract checkpoint type from filename
+        checkpoint_filename = os.path.basename(checkpoint_path)
+        checkpoint_type = "unknown"
+
+        if "best" in checkpoint_filename.lower():
+            checkpoint_type = "best"
+        elif "latest" in checkpoint_filename.lower():
+            checkpoint_type = "latest"
+        elif "epoch" in checkpoint_filename.lower():
+            # Extract epoch number if present
+            import re
+            epoch_match = re.search(r'epoch_(\d+)', checkpoint_filename.lower())
+            if epoch_match:
+                checkpoint_type = f"epoch{epoch_match.group(1)}"
+            else:
+                checkpoint_type = "epoch"
+        elif "checkpoint" in checkpoint_filename.lower():
+            checkpoint_type = "checkpoint"
+
+        # Generate timestamp
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # Create the output directory name
+        output_dir = os.path.join(base_dir, f"{parent_dir_name}_{checkpoint_type}_{timestamp}")
+    else:
+        # Multiple checkpoints - create a cross-validation summary directory
+        # Try to extract common experiment name from checkpoint paths
+        common_parts = []
+        for path in checkpoint_paths:
+            # Extract the experiment directory name - handle both old and new formats
+            checkpoint_dir = os.path.dirname(path)
+            checkpoint_dir_name = os.path.basename(checkpoint_dir)
+
+            # Check if checkpoint is in a "checkpoints" subdirectory (new format)
+            if checkpoint_dir_name == "checkpoints":
+                # New format: outputs/experiment-name/checkpoints/checkpoint.pt
+                experiment_dir = os.path.dirname(checkpoint_dir)
+                dir_name = os.path.basename(experiment_dir)
+            else:
+                # Old format: outputs_centralized/experiment-name/checkpoint.pth
+                dir_name = checkpoint_dir_name
+
+            common_parts.append(dir_name)
+
+        # Find common base experiment name
+        if common_parts:
+            import re
+
+            # Try to find the longest common prefix that makes sense
+            base_name = None
+
+            # Method 1: Remove seed-specific parts and timestamps
+            first_name = common_parts[0]
+            # Remove patterns like "_seed1", "-seed01", "_seed101", timestamps, etc.
+            base_candidate = re.sub(r'[-_]seed\d+|_fold[-_]?\d+|_cv[-_]?\d+|_\d{8}_\d{6}', '', first_name)
+
+            # Verify this base name is common across all checkpoint directories
+            if base_candidate and len(base_candidate) > 5:  # Ensure meaningful name
+                is_common = True
+                for dir_name in common_parts:
+                    if not dir_name.startswith(base_candidate):
+                        is_common = False
+                        break
+
+                if is_common:
+                    base_name = base_candidate
+
+            # Method 2: Find the longest common prefix if Method 1 failed
+            if not base_name:
+                # Find longest common prefix
+                min_length = min(len(name) for name in common_parts)
+                common_prefix_length = 0
+
+                for i in range(min_length):
+                    if all(name[i] == common_parts[0][i] for name in common_parts):
+                        common_prefix_length = i + 1
+                    else:
+                        break
+
+                if common_prefix_length > 5:  # Ensure meaningful length
+                    common_prefix = common_parts[0][:common_prefix_length]
+                    # Clean up the prefix (remove trailing underscores, dashes)
+                    base_name = re.sub(r'[-_]+$', '', common_prefix)
+
+            # Method 3: Extract meaningful parts if still no base name
+            if not base_name:
+                # Try to extract key components (model name, dataset info, etc.)
+                # Split by both underscores and hyphens, then rejoin appropriately
+                import re
+                # Use a more sophisticated approach: remove seed/timestamp patterns first
+                cleaned_name = re.sub(r'[-_]seed\d+|_\d{8}_\d{6}', '', first_name)
+
+                # If that gives us a reasonable name, use it
+                if cleaned_name and len(cleaned_name) > 5:
+                    base_name = cleaned_name
+                else:
+                    # Fallback: split and filter parts
+                    first_parts = re.split(r'[-_]', first_name)
+                    meaningful_parts = []
+
+                    for part in first_parts:
+                        # Skip seed, timestamp, and fold patterns
+                        if not re.match(r'seed\d+|\d{8}|\d{6}|fold\d+|cv\d+', part):
+                            meaningful_parts.append(part)
+                            # Stop before we get too specific
+                            if len(meaningful_parts) >= 6:
+                                break
+
+                    if meaningful_parts:
+                        # Try to preserve the original separator style
+                        if '-' in first_name and '_' in first_name:
+                            # Mixed separators - use hyphens for main parts, underscores for details
+                            base_name = '-'.join(meaningful_parts[:3]) + '_' + '_'.join(meaningful_parts[3:])
+                        elif '-' in first_name:
+                            base_name = '-'.join(meaningful_parts)
+                        else:
+                            base_name = '_'.join(meaningful_parts)
+
+            # Fallback
+            if not base_name or len(base_name) < 3:
+                base_name = "cv_experiment"
+        else:
+            base_name = "cv_experiment"
+
+        # Extract checkpoint type from the first checkpoint
+        checkpoint_filename = os.path.basename(checkpoint_paths[0])
+        checkpoint_type = "unknown"
+        if "best" in checkpoint_filename.lower():
+            checkpoint_type = "best"
+        elif "latest" in checkpoint_filename.lower():
+            checkpoint_type = "latest"
+        elif "epoch" in checkpoint_filename.lower():
+            checkpoint_type = "epoch"
+
+        # Count number of checkpoints for the directory name
+        num_folds = len(checkpoint_paths)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = os.path.join(base_dir, f"{base_name}_cv{num_folds}folds_{checkpoint_type}_{timestamp}")
+
+    return output_dir
+
+
+def load_model_from_checkpoint(
+    checkpoint_path: str,
+    args: Any,
+    device: torch.device
+) -> nn.Module:
+    """Load model from checkpoint.
+
+    Args:
+        checkpoint_path: Path to the checkpoint file
+        args: Command line arguments object
+        device: Device to load the model on
+
+    Returns:
+        Loaded model
+    """
+    print(f"Loading model from checkpoint: {checkpoint_path}")
+
+    # Create model with the same configuration
+    model_kwargs = {}
+
+    # Set num_classes based on classification_mode
+    if args.classification_mode == "CN_AD":
+        model_kwargs["num_classes"] = 2
+        print(f"Setting num_classes=2 for classification_mode={args.classification_mode}")
+    else:
+        model_kwargs["num_classes"] = 3  # Default for CN_MCI_AD
+        print(f"Setting num_classes=3 for classification_mode={args.classification_mode}")
+
+    # Add model-specific parameters with defaults
+    if args.model_name == "resnet3d":
+        model_kwargs["model_depth"] = 18  # Default depth
+    elif args.model_name == "densenet3d":
+        # Use DenseNet defaults if not specified
+        pass  # ModelFactory will use defaults
+
+    # Handle SecureFedCNN configuration
+    if args.model_name == "securefed_cnn":
+        model_kwargs["data"] = {
+            "resize_size": args.resize_size,
+            "classification_mode": args.classification_mode
+        }
+
+    # Handle RosannaCNN configuration
+    elif args.model_name in ["rosanna_cnn", "pretrained_cnn"]:
+        model_kwargs["data"] = {
+            "resize_size": args.resize_size,
+            "classification_mode": args.classification_mode
+        }
+
+        # For RosannaCNN, add parameters directly with defaults
+        model_kwargs["freeze_encoder"] = False  # Default value
+        model_kwargs["dropout"] = 0.0  # Default value
+        model_kwargs["input_channels"] = 1  # Default to 1 channel for MRI data
+
+    # Create model (ensure no pretrained_checkpoint is passed for test mode)
+    print(f"Creating model with kwargs: {model_kwargs}")
+    model = ModelFactory.create_model(args.model_name, **model_kwargs)
+    model = model.to(device)
+
+    # Load checkpoint
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+
+        # Handle different checkpoint formats
+        if isinstance(checkpoint, dict):
+            if 'model_state_dict' in checkpoint:
+                # Training checkpoint format
+                state_dict = checkpoint['model_state_dict']
+                print("Loading from training checkpoint format")
+            elif 'state_dict' in checkpoint:
+                # Alternative checkpoint format
+                state_dict = checkpoint['state_dict']
+                print("Loading from state_dict checkpoint format")
+            else:
+                # Assume the entire dict is the state dict
+                state_dict = checkpoint
+                print("Loading from direct state dict format")
+        else:
+            # Direct state dict
+            state_dict = checkpoint
+            print("Loading from direct state dict")
+
+        # Load with shape checking
+        current_state_dict = model.state_dict()
+
+        # Check for shape mismatches
+        mismatched_keys = []
+        for key, value in state_dict.items():
+            if key in current_state_dict:
+                if current_state_dict[key].shape != value.shape:
+                    mismatched_keys.append(f"{key}: expected {current_state_dict[key].shape}, got {value.shape}")
+
+        if mismatched_keys:
+            print("Warning: Found shape mismatches in checkpoint:")
+            for mismatch in mismatched_keys:
+                print(f"  {mismatch}")
+            print("Loading with strict=False to skip mismatched layers")
+            model.load_state_dict(state_dict, strict=False)
+        else:
+            model.load_state_dict(state_dict)
+
+        print("✓ Model loaded successfully")
+
+        # Print additional checkpoint info if available
+        if isinstance(checkpoint, dict) and 'epoch' in checkpoint:
+            print(f"Checkpoint info: epoch {checkpoint['epoch']}")
+            if 'val_acc' in checkpoint:
+                print(f"Checkpoint validation accuracy: {checkpoint['val_acc']:.2f}%")
+
+    except Exception as e:
+        raise RuntimeError(f"Failed to load checkpoint: {e}") from e
+
+    return model
+
+
+def calculate_dataset_statistics(dataset: Any, classification_mode: str) -> Dict[str, Any]:
+    """Calculate statistics for the dataset.
+
+    Args:
+        dataset: The dataset to analyze
+        classification_mode: Classification mode (CN_AD or CN_MCI_AD)
+
+    Returns:
+        Dictionary containing dataset statistics
+    """
+    print("Calculating dataset statistics...")
+
+    # Get all labels
+    labels = []
+    for i in range(len(dataset)):
+        sample = dataset[i]
+        if isinstance(sample, dict):
+            label = sample['label']
+            if hasattr(label, 'item'):
+                label = label.item()
+            labels.append(label)
+        else:
+            # Handle tuple format (image, label)
+            labels.append(sample[1])
+
+    labels = np.array(labels)
+
+    # Class mapping
+    if classification_mode == "CN_AD":
+        class_names = ["CN", "AD"]
+        num_classes = 2
+    else:
+        class_names = ["CN", "MCI", "AD"]
+        num_classes = 3
+
+    # Calculate statistics
+    unique_labels, counts = np.unique(labels, return_counts=True)
+
+    stats = {
+        "total_samples": len(labels),
+        "num_classes": num_classes,
+        "class_names": class_names,
+        "class_distribution": {class_names[i]: int(counts[np.where(unique_labels == i)[0][0]])
+                              if i in unique_labels else 0 for i in range(num_classes)},
+        "class_percentages": {},
+        "min_class_size": int(np.min(counts)),
+        "max_class_size": int(np.max(counts)),
+        "class_imbalance_ratio": float(np.max(counts) / np.min(counts)),
+    }
+
+    # Calculate percentages
+    total = stats["total_samples"]
+    for class_name, count in stats["class_distribution"].items():
+        stats["class_percentages"][class_name] = round(100.0 * count / total, 2)
+
+    return stats
+
+
+def evaluate_model(
+    model: nn.Module,
+    test_loader: DataLoader,
+    device: torch.device,
+    classification_mode: str,
+    dataset: Any = None
+) -> Tuple[Dict[str, Any], np.ndarray, np.ndarray, np.ndarray, float, List[str]]:
+    """Evaluate the model on test data.
+
+    Args:
+        model: Model to evaluate
+        test_loader: Test data loader
+        device: Device to run evaluation on
+        classification_mode: Classification mode
+        dataset: Dataset object to extract image paths from
+
+    Returns:
+        Tuple of (metrics_dict, true_labels, predicted_labels, predicted_probs, inference_time, image_paths)
+    """
+    print("Running model evaluation...")
+
+    model.eval()
+    all_labels = []
+    all_predictions = []
+    all_probabilities = []
+    all_image_paths = []
+    total_inference_time = 0.0
+
+        # Progress bar
+    pbar = tqdm(test_loader, desc="Evaluating", leave=False)
+    batch_index = 0
+
+    with torch.no_grad():
+        for batch in pbar:
+            if isinstance(batch, dict):
+                images = batch["image"].to(device)
+                labels = batch["label"].to(device)
+            else:
+                images, labels = batch
+                images = images.to(device)
+                labels = labels.to(device)
+
+            batch_size = images.size(0)
+
+            # Extract image paths from dataset if available
+            if dataset is not None:
+                # Try different ways to access dataset data
+                data_list = None
+                if hasattr(dataset, 'data_list'):
+                    data_list = dataset.data_list
+                elif hasattr(dataset, 'base') and hasattr(dataset.base, 'data_list'):
+                    # For datasets that wrap a base dataset
+                    data_list = dataset.base.data_list
+                elif hasattr(dataset, 'dataset') and hasattr(dataset.dataset, 'data_list'):
+                    # For other wrapped datasets
+                    data_list = dataset.dataset.data_list
+
+                if data_list is not None:
+                    # Calculate the indices for this batch (handle shuffling correctly)
+                    start_idx = batch_index * test_loader.batch_size
+                    batch_image_paths = []
+                    for i in range(batch_size):
+                        idx = start_idx + i
+                        if idx < len(data_list):
+                            # Handle different data structures
+                            item = data_list[idx]
+                            if isinstance(item, dict) and "image" in item:
+                                image_path = item["image"]
+                            elif hasattr(item, 'get'):
+                                image_path = item.get("image", f"image_{idx}")
+                            else:
+                                image_path = f"image_{idx}"
+                            batch_image_paths.append(str(image_path))
+                        else:
+                            batch_image_paths.append(f"image_{idx}")
+                else:
+                    # Fallback: generate placeholder names
+                    batch_image_paths = [f"image_{len(all_image_paths) + i}" for i in range(batch_size)]
+            else:
+                # Fallback: generate placeholder names
+                batch_image_paths = [f"image_{len(all_image_paths) + i}" for i in range(batch_size)]
+
+            batch_index += 1
+
+            # Time inference
+            start_time = time.time()
+            outputs = model(images)
+            inference_time = time.time() - start_time
+            total_inference_time += inference_time
+
+            # Get predictions and probabilities
+            probabilities = torch.softmax(outputs, dim=1)
+            _, predicted = torch.max(outputs, 1)
+
+            # Collect results
+            all_labels.extend(labels.cpu().numpy())
+            all_predictions.extend(predicted.cpu().numpy())
+            all_probabilities.extend(probabilities.cpu().numpy())
+
+            # Collect image paths
+            if isinstance(batch_image_paths, (list, tuple)):
+                all_image_paths.extend(batch_image_paths)
+            else:
+                # Handle single path or tensor
+                if hasattr(batch_image_paths, 'tolist'):
+                    all_image_paths.extend(batch_image_paths.tolist())
+                else:
+                    all_image_paths.append(str(batch_image_paths))
+
+    # Convert to numpy arrays
+    true_labels = np.array(all_labels)
+    predicted_labels = np.array(all_predictions)
+    predicted_probs = np.array(all_probabilities)
+
+    # Calculate metrics
+    accuracy = accuracy_score(true_labels, predicted_labels)
+
+    # Class names
+    if classification_mode == "CN_AD":
+        class_names = ["CN", "AD"]
+        num_classes = 2
+    else:
+        class_names = ["CN", "MCI", "AD"]
+        num_classes = 3
+
+    # Precision, recall, F1-score
+    precision, recall, f1, support = precision_recall_fscore_support(
+        true_labels, predicted_labels, average=None, zero_division=0
+    )
+
+    # Macro and weighted averages
+    precision_macro, recall_macro, f1_macro, _ = precision_recall_fscore_support(
+        true_labels, predicted_labels, average='macro', zero_division=0
+    )
+    precision_weighted, recall_weighted, f1_weighted, _ = precision_recall_fscore_support(
+        true_labels, predicted_labels, average='weighted', zero_division=0
+    )
+
+    # AUC calculation
+    auc_scores = {}
+    if num_classes == 2:
+        # Binary classification - single AUC
+        if len(np.unique(true_labels)) == 2:  # Ensure both classes are present
+            auc_scores["binary"] = roc_auc_score(true_labels, predicted_probs[:, 1])
+    else:
+        # Multi-class classification - AUC per class (one-vs-rest)
+        try:
+            auc_per_class = roc_auc_score(true_labels, predicted_probs, multi_class='ovr', average=None)
+            for i, class_name in enumerate(class_names):
+                if i < len(auc_per_class):
+                    auc_scores[f"{class_name}_vs_rest"] = auc_per_class[i]
+            # Macro average
+            auc_scores["macro_average"] = roc_auc_score(true_labels, predicted_probs, multi_class='ovr', average='macro')
+        except ValueError as e:
+            print(f"Could not calculate AUC: {e}")
+
+    # Top-k accuracy (useful for multi-class)
+    top_k_acc = {}
+    if num_classes > 2:
+        for k in [2, 3]:
+            if k <= num_classes:
+                # Get top-k predictions
+                top_k_preds = np.argsort(predicted_probs, axis=1)[:, -k:]
+                top_k_correct = np.array([true_labels[i] in top_k_preds[i] for i in range(len(true_labels))])
+                top_k_acc[f"top_{k}"] = np.mean(top_k_correct)
+
+    # Confidence analysis
+    max_probs = np.max(predicted_probs, axis=1)
+    confidence_stats = {
+        "mean_confidence": float(np.mean(max_probs)),
+        "std_confidence": float(np.std(max_probs)),
+        "min_confidence": float(np.min(max_probs)),
+        "max_confidence": float(np.max(max_probs)),
+    }
+
+    # Organize metrics
+    metrics = {
+        "accuracy": float(accuracy),
+        "precision_per_class": {class_names[i]: float(precision[i]) for i in range(len(precision))},
+        "recall_per_class": {class_names[i]: float(recall[i]) for i in range(len(recall))},
+        "f1_per_class": {class_names[i]: float(f1[i]) for i in range(len(f1))},
+        "support_per_class": {class_names[i]: int(support[i]) for i in range(len(support))},
+        "precision_macro": float(precision_macro),
+        "recall_macro": float(recall_macro),
+        "f1_macro": float(f1_macro),
+        "precision_weighted": float(precision_weighted),
+        "recall_weighted": float(recall_weighted),
+        "f1_weighted": float(f1_weighted),
+        "auc_scores": auc_scores,
+        "top_k_accuracy": top_k_acc,
+        "confidence_stats": confidence_stats,
+        "total_inference_time": total_inference_time,
+        "avg_inference_time_per_batch": total_inference_time / len(test_loader),
+        "avg_inference_time_per_sample": total_inference_time / len(true_labels),
+    }
+
+    return metrics, true_labels, predicted_labels, predicted_probs, total_inference_time, all_image_paths
+
+
+def plot_roc_curves(
+    true_labels: np.ndarray,
+    predicted_probs: np.ndarray,
+    classification_mode: str,
+    save_path: str
+) -> None:
+    """Plot ROC curves.
+
+    Args:
+        true_labels: True labels
+        predicted_probs: Predicted probabilities
+        classification_mode: Classification mode
+        save_path: Path to save the plot
+    """
+    if classification_mode == "CN_AD":
+        class_names = ["CN", "AD"]
+        num_classes = 2
+    else:
+        class_names = ["CN", "MCI", "AD"]
+        num_classes = 3
+
+    plt.figure(figsize=(10, 8))
+
+    if num_classes == 2:
+        # Binary classification
+        if len(np.unique(true_labels)) == 2:
+            fpr, tpr, _ = roc_curve(true_labels, predicted_probs[:, 1])
+            auc = roc_auc_score(true_labels, predicted_probs[:, 1])
+            plt.plot(fpr, tpr, linewidth=2, label=f'ROC Curve (AUC = {auc:.3f})')
+        else:
+            print("Warning: Only one class present in test set, cannot plot ROC curve")
+            return
+    else:
+        # Multi-class classification (one-vs-rest)
+        try:
+            for i, class_name in enumerate(class_names):
+                # Create binary labels for current class vs rest
+                binary_labels = (true_labels == i).astype(int)
+                if len(np.unique(binary_labels)) == 2:  # Both classes present
+                    fpr, tpr, _ = roc_curve(binary_labels, predicted_probs[:, i])
+                    auc = roc_auc_score(binary_labels, predicted_probs[:, i])
+                    plt.plot(fpr, tpr, linewidth=2, label=f'{class_name} (AUC = {auc:.3f})')
+        except ValueError as e:
+            print(f"Could not plot ROC curves: {e}")
+            return
+
+    # Plot diagonal line
+    plt.plot([0, 1], [0, 1], 'k--', linewidth=1, alpha=0.7)
+    plt.xlim([0.0, 1.0])
+    plt.ylim([0.0, 1.05])
+    plt.xlabel('False Positive Rate')
+    plt.ylabel('True Positive Rate')
+    plt.title('Receiver Operating Characteristic (ROC) Curves')
+    plt.legend(loc="lower right")
+    plt.grid(True, alpha=0.3)
+
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Saved ROC curves to {save_path}")
+
+
+def plot_confidence_histogram(
+    predicted_probs: np.ndarray,
+    predicted_labels: np.ndarray,
+    true_labels: np.ndarray,
+    classification_mode: str,
+    save_path: str
+) -> None:
+    """Plot confidence score histogram.
+
+    Args:
+        predicted_probs: Predicted probabilities
+        predicted_labels: Predicted labels
+        true_labels: True labels
+        classification_mode: Classification mode
+        save_path: Path to save the plot
+    """
+    if classification_mode == "CN_AD":
+        class_names = ["CN", "AD"]
+    else:
+        class_names = ["CN", "MCI", "AD"]
+
+    # Get maximum probability (confidence) for each prediction
+    max_probs = np.max(predicted_probs, axis=1)
+
+    # Separate correct and incorrect predictions
+    correct_mask = predicted_labels == true_labels
+    correct_confidences = max_probs[correct_mask]
+    incorrect_confidences = max_probs[~correct_mask]
+
+    plt.figure(figsize=(12, 6))
+
+    # Plot histograms
+    plt.subplot(1, 2, 1)
+    plt.hist(correct_confidences, bins=30, alpha=0.7, label='Correct Predictions', color='green')
+    plt.hist(incorrect_confidences, bins=30, alpha=0.7, label='Incorrect Predictions', color='red')
+    plt.xlabel('Confidence Score')
+    plt.ylabel('Frequency')
+    plt.title('Confidence Score Distribution')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+
+    # Plot confidence by class
+    plt.subplot(1, 2, 2)
+    for i, class_name in enumerate(class_names):
+        class_mask = predicted_labels == i
+        if np.any(class_mask):
+            class_confidences = max_probs[class_mask]
+            plt.hist(class_confidences, bins=20, alpha=0.7, label=f'{class_name}')
+
+    plt.xlabel('Confidence Score')
+    plt.ylabel('Frequency')
+    plt.title('Confidence Score by Predicted Class')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+    print(f"Saved confidence histogram to {save_path}")
+
+
+def save_results(
+    results: Dict[str, Any],
+    save_path: str
+) -> None:
+    """Save evaluation results to JSON file.
+
+    Args:
+        results: Results dictionary
+        save_path: Path to save the JSON file
+    """
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+    with open(save_path, 'w') as f:
+        json.dump(results, f, indent=2)
+
+    print(f"Saved results to {save_path}")
+
+
+def save_predictions_csv(
+    image_paths: List[str],
+    true_labels: np.ndarray,
+    predicted_labels: np.ndarray,
+    predicted_probs: np.ndarray,
+    classification_mode: str,
+    save_path: str
+) -> None:
+    """Save detailed predictions to CSV file.
+
+    Args:
+        image_paths: List of image file paths
+        true_labels: True labels
+        predicted_labels: Predicted labels
+        predicted_probs: Predicted probabilities for each class
+        classification_mode: Classification mode
+        save_path: Path to save the CSV file
+    """
+    # Class names mapping
+    if classification_mode == "CN_AD":
+        class_names = ["CN", "AD"]
+    else:
+        class_names = ["CN", "MCI", "AD"]
+
+    # Prepare data for CSV
+    csv_data = []
+
+    for i in range(len(image_paths)):
+        # Basic information
+        row = {
+            "image_path": image_paths[i],
+            "image_filename": os.path.basename(image_paths[i]) if isinstance(image_paths[i], str) else str(image_paths[i]),
+            "true_label_numeric": int(true_labels[i]),
+            "true_label_name": class_names[int(true_labels[i])],
+            "predicted_label_numeric": int(predicted_labels[i]),
+            "predicted_label_name": class_names[int(predicted_labels[i])],
+            "prediction_correct": bool(true_labels[i] == predicted_labels[i]),
+            "max_confidence": float(np.max(predicted_probs[i])),
+        }
+
+        # Add probability for each class
+        for j, class_name in enumerate(class_names):
+            row[f"prob_{class_name}"] = float(predicted_probs[i][j])
+
+        # Add confidence margin (difference between top 2 predictions)
+        sorted_probs = np.sort(predicted_probs[i])[::-1]  # Sort descending
+        if len(sorted_probs) >= 2:
+            row["confidence_margin"] = float(sorted_probs[0] - sorted_probs[1])
+        else:
+            row["confidence_margin"] = float(sorted_probs[0])
+
+        csv_data.append(row)
+
+    # Create DataFrame and save
+    df = pd.DataFrame(csv_data)
+
+    # Sort by image filename for easier browsing
+    df = df.sort_values("image_filename")
+
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    df.to_csv(save_path, index=False)
+
+    print(f"Saved detailed predictions to {save_path}")
+
+    # Print summary statistics
+    correct_predictions = df["prediction_correct"].sum()
+    total_predictions = len(df)
+    accuracy = correct_predictions / total_predictions
+
+    print(f"Prediction Summary:")
+    print(f"  Total samples: {total_predictions}")
+    print(f"  Correct predictions: {correct_predictions}")
+    print(f"  Accuracy: {accuracy:.4f} ({accuracy*100:.2f}%)")
+    print(f"  Mean confidence: {df['max_confidence'].mean():.4f}")
+    print(f"  Mean confidence margin: {df['confidence_margin'].mean():.4f}")
+
+    # Per-class breakdown
+    print(f"  Per-class accuracy:")
+    for class_name in class_names:
+        class_df = df[df["true_label_name"] == class_name]
+        if len(class_df) > 0:
+            class_acc = class_df["prediction_correct"].mean()
+            print(f"    {class_name}: {class_acc:.4f} ({class_acc*100:.2f}%) - {len(class_df)} samples")
+
+
+def print_summary(
+    dataset_stats: Dict[str, Any],
+    metrics: Dict[str, Any],
+    classification_mode: str
+) -> None:
+    """Print evaluation summary.
+
+    Args:
+        dataset_stats: Dataset statistics
+        metrics: Evaluation metrics
+        classification_mode: Classification mode
+    """
+    print("\n" + "="*80)
+    print("EVALUATION SUMMARY")
+    print("="*80)
+
+    # Dataset statistics
+    print(f"\nDataset Statistics:")
+    print(f"  Total samples: {dataset_stats['total_samples']}")
+    print(f"  Number of classes: {dataset_stats['num_classes']}")
+    print(f"  Classification mode: {classification_mode}")
+    print(f"  Class distribution:")
+    for class_name, count in dataset_stats['class_distribution'].items():
+        percentage = dataset_stats['class_percentages'][class_name]
+        print(f"    {class_name}: {count} samples ({percentage}%)")
+    print(f"  Class imbalance ratio: {dataset_stats['class_imbalance_ratio']:.2f}")
+
+    # Performance metrics
+    print(f"\nPerformance Metrics:")
+    print(f"  Overall Accuracy: {metrics['accuracy']:.4f} ({metrics['accuracy']*100:.2f}%)")
+    print(f"  Macro F1-Score: {metrics['f1_macro']:.4f}")
+    print(f"  Weighted F1-Score: {metrics['f1_weighted']:.4f}")
+
+    print(f"\nPer-Class Metrics:")
+    class_names = list(metrics['precision_per_class'].keys())
+    print(f"{'Class':<8} {'Precision':<10} {'Recall':<10} {'F1-Score':<10} {'Support':<10}")
+    print("-" * 58)
+    for class_name in class_names:
+        precision = metrics['precision_per_class'][class_name]
+        recall = metrics['recall_per_class'][class_name]
+        f1 = metrics['f1_per_class'][class_name]
+        support = metrics['support_per_class'][class_name]
+        print(f"{class_name:<8} {precision:<10.4f} {recall:<10.4f} {f1:<10.4f} {support:<10}")
+
+    # AUC scores
+    if metrics['auc_scores']:
+        print(f"\nAUC Scores:")
+        for auc_name, auc_value in metrics['auc_scores'].items():
+            print(f"  {auc_name}: {auc_value:.4f}")
+
+    # Top-k accuracy
+    if metrics['top_k_accuracy']:
+        print(f"\nTop-K Accuracy:")
+        for k_name, k_value in metrics['top_k_accuracy'].items():
+            print(f"  {k_name}: {k_value:.4f} ({k_value*100:.2f}%)")
+
+    # Timing information
+    print(f"\nTiming Information:")
+    print(f"  Total inference time: {metrics['total_inference_time']:.4f} seconds")
+    print(f"  Average time per batch: {metrics['avg_inference_time_per_batch']:.4f} seconds")
+    print(f"  Average time per sample: {metrics['avg_inference_time_per_sample']:.6f} seconds")
+
+    # Confidence statistics
+    conf_stats = metrics['confidence_stats']
+    print(f"\nConfidence Statistics:")
+    print(f"  Mean confidence: {conf_stats['mean_confidence']:.4f}")
+    print(f"  Std confidence: {conf_stats['std_confidence']:.4f}")
+    print(f"  Min confidence: {conf_stats['min_confidence']:.4f}")
+    print(f"  Max confidence: {conf_stats['max_confidence']:.4f}")
+
+    print("="*80)
+
+
+def aggregate_cv_results(all_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Aggregate results from multiple cross-validation folds.
+
+    Args:
+        all_results: List of result dictionaries from each fold
+
+    Returns:
+        Aggregated results with mean and standard deviation
+    """
+    if not all_results:
+        return {}
+
+    # Extract metrics from all folds
+    all_metrics = [result['evaluation_metrics'] for result in all_results]
+
+    # Get classification mode from first result
+    classification_mode = all_results[0]['configuration']['classification_mode']
+
+    if classification_mode == "CN_AD":
+        class_names = ["CN", "AD"]
+    else:
+        class_names = ["CN", "MCI", "AD"]
+
+    # Initialize aggregation structure
+    aggregated = {
+        "num_folds": len(all_results),
+        "classification_mode": classification_mode,
+        "class_names": class_names,
+        "fold_results": [],
+        "summary_statistics": {}
+    }
+
+    # Collect key metrics from each fold
+    metrics_to_aggregate = [
+        "accuracy",
+        "precision_macro",
+        "recall_macro",
+        "f1_macro",
+        "precision_weighted",
+        "recall_weighted",
+        "f1_weighted"
+    ]
+
+    # Per-class metrics
+    per_class_metrics = ["precision_per_class", "recall_per_class", "f1_per_class"]
+
+    # Initialize collection arrays
+    metric_values = {metric: [] for metric in metrics_to_aggregate}
+
+    # Per-class metric collection
+    class_metric_values = {}
+    for metric in per_class_metrics:
+        class_metric_values[metric] = {class_name: [] for class_name in class_names}
+
+    # AUC scores collection
+    auc_metric_values = {}
+
+    # Timing metrics
+    timing_metrics = ["total_inference_time", "avg_inference_time_per_sample"]
+    timing_values = {metric: [] for metric in timing_metrics}
+
+    # Confidence metrics
+    confidence_metrics = ["mean_confidence", "std_confidence"]
+    confidence_values = {metric: [] for metric in confidence_metrics}
+
+    # Collect metrics from each fold
+    for i, metrics in enumerate(all_metrics):
+        fold_summary = {"fold": i+1}
+
+        # Basic metrics
+        for metric in metrics_to_aggregate:
+            if metric in metrics:
+                value = metrics[metric]
+                metric_values[metric].append(value)
+                fold_summary[metric] = value
+
+        # Per-class metrics
+        for metric in per_class_metrics:
+            if metric in metrics:
+                fold_summary[metric] = {}
+                for class_name in class_names:
+                    if class_name in metrics[metric]:
+                        value = metrics[metric][class_name]
+                        class_metric_values[metric][class_name].append(value)
+                        fold_summary[metric][class_name] = value
+
+        # AUC scores
+        if "auc_scores" in metrics:
+            fold_summary["auc_scores"] = metrics["auc_scores"]
+            for auc_name, auc_value in metrics["auc_scores"].items():
+                if auc_name not in auc_metric_values:
+                    auc_metric_values[auc_name] = []
+                auc_metric_values[auc_name].append(auc_value)
+
+        # Timing metrics
+        for metric in timing_metrics:
+            if metric in metrics:
+                value = metrics[metric]
+                timing_values[metric].append(value)
+                fold_summary[metric] = value
+
+        # Confidence metrics
+        if "confidence_stats" in metrics:
+            fold_summary["confidence_stats"] = metrics["confidence_stats"]
+            for metric in confidence_metrics:
+                if metric in metrics["confidence_stats"]:
+                    value = metrics["confidence_stats"][metric]
+                    confidence_values[metric].append(value)
+
+        aggregated["fold_results"].append(fold_summary)
+
+    # Calculate summary statistics
+    summary = {}
+
+    # Basic metrics statistics
+    for metric in metrics_to_aggregate:
+        values = metric_values[metric]
+        if values:
+            summary[metric] = {
+                "mean": float(np.mean(values)),
+                "std": float(np.std(values)),
+                "min": float(np.min(values)),
+                "max": float(np.max(values)),
+                "values": values
+            }
+
+    # Per-class metrics statistics
+    for metric in per_class_metrics:
+        summary[metric] = {}
+        for class_name in class_names:
+            values = class_metric_values[metric][class_name]
+            if values:
+                summary[metric][class_name] = {
+                    "mean": float(np.mean(values)),
+                    "std": float(np.std(values)),
+                    "min": float(np.min(values)),
+                    "max": float(np.max(values)),
+                    "values": values
+                }
+
+    # AUC statistics
+    if auc_metric_values:
+        summary["auc_scores"] = {}
+        for auc_name, values in auc_metric_values.items():
+            if values:
+                summary["auc_scores"][auc_name] = {
+                    "mean": float(np.mean(values)),
+                    "std": float(np.std(values)),
+                    "min": float(np.min(values)),
+                    "max": float(np.max(values)),
+                    "values": values
+                }
+
+    # Timing statistics
+    for metric in timing_metrics:
+        values = timing_values[metric]
+        if values:
+            summary[metric] = {
+                "mean": float(np.mean(values)),
+                "std": float(np.std(values)),
+                "min": float(np.min(values)),
+                "max": float(np.max(values)),
+                "values": values
+            }
+
+    # Confidence statistics
+    if any(confidence_values.values()):
+        summary["confidence_stats"] = {}
+        for metric in confidence_metrics:
+            values = confidence_values[metric]
+            if values:
+                summary["confidence_stats"][metric] = {
+                    "mean": float(np.mean(values)),
+                    "std": float(np.std(values)),
+                    "min": float(np.min(values)),
+                    "max": float(np.max(values)),
+                    "values": values
+                }
+
+    aggregated["summary_statistics"] = summary
+
+    return aggregated
+
+
+def print_cv_summary_table(aggregated_results: Dict[str, Any]) -> None:
+    """Print a comprehensive summary table of cross-validation results.
+
+    Args:
+        aggregated_results: Aggregated results from multiple folds
+    """
+    if not aggregated_results:
+        print("No results to summarize.")
+        return
+
+    num_folds = aggregated_results["num_folds"]
+    class_names = aggregated_results["class_names"]
+    summary = aggregated_results["summary_statistics"]
+
+    print("\n" + "="*100)
+    print(f"CROSS-VALIDATION SUMMARY ({num_folds} FOLDS)")
+    print("="*100)
+
+    # Overall Performance Metrics
+    print(f"\nOVERALL PERFORMANCE METRICS:")
+    print("-" * 60)
+    print(f"{'Metric':<25} {'Mean':<12} {'Std':<12} {'Min':<12} {'Max':<12}")
+    print("-" * 60)
+
+    key_metrics = ["accuracy", "f1_macro", "f1_weighted", "precision_macro", "recall_macro"]
+    for metric in key_metrics:
+        if metric in summary:
+            stats = summary[metric]
+            print(f"{metric.replace('_', ' ').title():<25} "
+                  f"{stats['mean']:.4f}      {stats['std']:.4f}      "
+                  f"{stats['min']:.4f}      {stats['max']:.4f}")
+
+    # Per-class Performance
+    print(f"\nPER-CLASS PERFORMANCE:")
+    print("-" * 80)
+
+    for class_name in class_names:
+        print(f"\nClass: {class_name}")
+        print(f"{'Metric':<15} {'Mean':<12} {'Std':<12} {'Min':<12} {'Max':<12}")
+        print("-" * 65)
+
+        class_metrics = ["precision_per_class", "recall_per_class", "f1_per_class"]
+        for metric in class_metrics:
+            if metric in summary and class_name in summary[metric]:
+                stats = summary[metric][class_name]
+                metric_name = metric.replace('_per_class', '').title()
+                print(f"{metric_name:<15} "
+                      f"{stats['mean']:.4f}      {stats['std']:.4f}      "
+                      f"{stats['min']:.4f}      {stats['max']:.4f}")
+
+    # AUC Scores
+    if "auc_scores" in summary:
+        print(f"\nAUC SCORES:")
+        print("-" * 70)
+        print(f"{'AUC Type':<20} {'Mean':<12} {'Std':<12} {'Min':<12} {'Max':<12}")
+        print("-" * 70)
+
+        for auc_name, stats in summary["auc_scores"].items():
+            auc_display = auc_name.replace('_', ' ').title()
+            print(f"{auc_display:<20} "
+                  f"{stats['mean']:.4f}      {stats['std']:.4f}      "
+                  f"{stats['min']:.4f}      {stats['max']:.4f}")
+
+    # Timing Information
+    timing_metrics = ["total_inference_time", "avg_inference_time_per_sample"]
+    timing_available = any(metric in summary for metric in timing_metrics)
+
+    if timing_available:
+        print(f"\nTIMING STATISTICS:")
+        print("-" * 80)
+        print(f"{'Timing Metric':<30} {'Mean':<12} {'Std':<12} {'Min':<12} {'Max':<12}")
+        print("-" * 80)
+
+        for metric in timing_metrics:
+            if metric in summary:
+                stats = summary[metric]
+                metric_name = metric.replace('_', ' ').title()
+                if "per_sample" in metric:
+                    print(f"{metric_name:<30} "
+                          f"{stats['mean']:.6f}    {stats['std']:.6f}    "
+                          f"{stats['min']:.6f}    {stats['max']:.6f}")
+                else:
+                    print(f"{metric_name:<30} "
+                          f"{stats['mean']:.4f}      {stats['std']:.4f}      "
+                          f"{stats['min']:.4f}      {stats['max']:.4f}")
+
+    # Confidence Statistics
+    if "confidence_stats" in summary:
+        print(f"\nCONFIDENCE STATISTICS:")
+        print("-" * 70)
+        print(f"{'Confidence Metric':<20} {'Mean':<12} {'Std':<12} {'Min':<12} {'Max':<12}")
+        print("-" * 70)
+
+        for metric, stats in summary["confidence_stats"].items():
+            metric_name = metric.replace('_', ' ').title()
+            print(f"{metric_name:<20} "
+                  f"{stats['mean']:.4f}      {stats['std']:.4f}      "
+                  f"{stats['min']:.4f}      {stats['max']:.4f}")
+
+    # Individual Fold Results
+    print(f"\nINDIVIDUAL FOLD RESULTS:")
+    print("-" * 100)
+    print(f"{'Fold':<6} {'Accuracy':<10} {'F1 Macro':<10} {'F1 Weighted':<12} {'Precision':<10} {'Recall':<10}")
+    print("-" * 100)
+
+    for fold_result in aggregated_results["fold_results"]:
+        fold_num = fold_result["fold"]
+        acc = fold_result.get("accuracy", 0.0)
+        f1_macro = fold_result.get("f1_macro", 0.0)
+        f1_weighted = fold_result.get("f1_weighted", 0.0)
+        precision = fold_result.get("precision_macro", 0.0)
+        recall = fold_result.get("recall_macro", 0.0)
+
+        print(f"{fold_num:<6} {acc:.4f}    {f1_macro:.4f}    "
+              f"{f1_weighted:.4f}      {precision:.4f}    {recall:.4f}")
+
+    print("="*100)
+
+
+def save_cv_summary(
+    aggregated_results: Dict[str, Any],
+    save_path: str
+) -> None:
+    """Save cross-validation summary results to JSON file.
+
+    Args:
+        aggregated_results: Aggregated results from multiple folds
+        save_path: Path to save the JSON file
+    """
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+    with open(save_path, 'w') as f:
+        json.dump(aggregated_results, f, indent=2)
+
+    print(f"Saved CV summary to {save_path}")
+
+
+def save_cv_summary_table(
+    aggregated_results: Dict[str, Any],
+    save_path: str
+) -> None:
+    """Save cross-validation summary table to CSV file.
+
+    Args:
+        aggregated_results: Aggregated results from multiple folds
+        save_path: Path to save the CSV file
+    """
+    if not aggregated_results:
+        return
+
+    summary = aggregated_results["summary_statistics"]
+    class_names = aggregated_results["class_names"]
+
+    # Prepare data for CSV
+    csv_data = []
+
+    # Overall metrics
+    key_metrics = ["accuracy", "f1_macro", "f1_weighted", "precision_macro", "recall_macro"]
+    for metric in key_metrics:
+        if metric in summary:
+            stats = summary[metric]
+            csv_data.append({
+                "Category": "Overall",
+                "Class": "All",
+                "Metric": metric.replace('_', ' ').title(),
+                "Mean": stats['mean'],
+                "Std": stats['std'],
+                "Min": stats['min'],
+                "Max": stats['max']
+            })
+
+    # Per-class metrics
+    class_metrics = ["precision_per_class", "recall_per_class", "f1_per_class"]
+    for class_name in class_names:
+        for metric in class_metrics:
+            if metric in summary and class_name in summary[metric]:
+                stats = summary[metric][class_name]
+                csv_data.append({
+                    "Category": "Per-Class",
+                    "Class": class_name,
+                    "Metric": metric.replace('_per_class', '').title(),
+                    "Mean": stats['mean'],
+                    "Std": stats['std'],
+                    "Min": stats['min'],
+                    "Max": stats['max']
+                })
+
+    # AUC scores
+    if "auc_scores" in summary:
+        for auc_name, stats in summary["auc_scores"].items():
+            csv_data.append({
+                "Category": "AUC",
+                "Class": "All",
+                "Metric": auc_name.replace('_', ' ').title(),
+                "Mean": stats['mean'],
+                "Std": stats['std'],
+                "Min": stats['min'],
+                "Max": stats['max']
+            })
+
+    # Create DataFrame and save
+    df = pd.DataFrame(csv_data)
+
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    df.to_csv(save_path, index=False)
+
+    print(f"Saved CV summary table to {save_path}")
+
+
+def main():
+    """Main function."""
+    parser = argparse.ArgumentParser(description="Evaluate ADNI classification model(s)")
+
+    # Essential arguments
+    parser.add_argument("--checkpoint", type=str, nargs='+', required=True,
+                       help="Path(s) to model checkpoint(s). For cross-validation, provide multiple checkpoint paths.")
+    parser.add_argument("--test_csv", type=str, required=True, help="Path to test CSV file")
+    parser.add_argument("--img_dir", type=str, required=True, help="Directory containing MRI images")
+
+    # Model and data configuration
+    parser.add_argument("--model_name", type=str, default=None, help="Model architecture (auto-detect from checkpoint if not specified)")
+    parser.add_argument("--classification_mode", type=str, choices=["CN_MCI_AD", "CN_AD"], default="CN_MCI_AD", help="Classification mode")
+    parser.add_argument("--mci_subtype_filter", type=str, nargs="*", default=None, help="MCI subtypes to include for CN_AD mode (e.g., EMCI LMCI)")
+    parser.add_argument("--resize_size", type=int, nargs=3, default=[128, 128, 128], help="Image resize dimensions [D H W]")
+
+    # Optional arguments
+    parser.add_argument("--output_dir", type=str, default=None, help="Directory to save evaluation results (default: auto-generated)")
+    parser.add_argument("--batch_size", type=int, default=8, help="Batch size for evaluation")
+    parser.add_argument("--num_workers", type=int, default=4, help="Number of data loading workers")
+    parser.add_argument("--device", type=str, default=None, help="Device to use (cuda/cpu)")
+    parser.add_argument("--visualize", action="store_true", help="Generate visualization plots")
+    parser.add_argument("--num_samples_viz", type=int, default=8, help="Number of samples to visualize")
+
+    args = parser.parse_args()
+
+    # Ensure checkpoint is a list
+    if isinstance(args.checkpoint, str):
+        checkpoint_paths = [args.checkpoint]
+    else:
+        checkpoint_paths = args.checkpoint
+
+    # Create output directory (auto-generate if not provided)
+    if args.output_dir is None:
+        args.output_dir = create_automatic_output_dir(checkpoint_paths)
+        print(f"Auto-generated output directory: {args.output_dir}")
+
+    os.makedirs(args.output_dir, exist_ok=True)
+
+    # Auto-detect or use provided model name
+    if args.model_name is None:
+        args.model_name = detect_model_name_from_checkpoint(checkpoint_paths[0])
+        print(f"Auto-detected model name: {args.model_name}")
+    else:
+        print(f"Using specified model name: {args.model_name}")
+
+    # Handle MCI subtype filter
+    mci_subtype_filter = args.mci_subtype_filter
+    if mci_subtype_filter is not None and len(mci_subtype_filter) == 0:
+        mci_subtype_filter = None
+
+    print("Using command line arguments for all configuration")
+
+    print(f"Test CSV: {args.test_csv}")
+    print(f"Images directory: {args.img_dir}")
+    print(f"Checkpoints: {checkpoint_paths}")
+    print(f"Number of checkpoints: {len(checkpoint_paths)}")
+    print(f"Output directory: {args.output_dir}")
+    print(f"Classification mode: {args.classification_mode}")
+    print(f"Resize size: {args.resize_size}")
+    if mci_subtype_filter:
+        print(f"MCI subtype filter: {mci_subtype_filter}")
+
+    # Set device
+    if args.device:
+        device = torch.device(args.device)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # Create test transforms from args
+    from adni_classification.datasets.transforms import get_transforms
+    test_transform = get_transforms(
+        mode="val",
+        resize_size=args.resize_size,
+        resize_mode="trilinear",
+        use_spacing=False,
+        spacing_size=(1.0, 1.0, 1.0),
+        device=None
+    )
+
+    # Create test dataset (shared across all checkpoints)
+    print("Creating test dataset...")
+    test_dataset = create_adni_dataset(
+        dataset_type="normal",  # Always use normal for testing (no caching)
+        csv_path=args.test_csv,
+        img_dir=args.img_dir,
+        transform=test_transform,
+        cache_rate=0.0,  # No caching for test
+        num_workers=0,  # No workers for cache in test
+        cache_dir="./cache",
+        classification_mode=args.classification_mode,
+        mci_subtype_filter=mci_subtype_filter,
+    )
+
+    # Create test data loader
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True
+    )
+
+    print(f"Test dataset created with {len(test_dataset)} samples")
+
+    # Calculate dataset statistics (only once)
+    dataset_stats = calculate_dataset_statistics(test_dataset, args.classification_mode)
+
+    # Store results from all checkpoints
+    all_results = []
+
+    # Evaluate each checkpoint
+    for i, checkpoint_path in enumerate(checkpoint_paths):
+        print(f"\n{'='*80}")
+        print(f"EVALUATING CHECKPOINT {i+1}/{len(checkpoint_paths)}")
+        print(f"Checkpoint: {checkpoint_path}")
+        print(f"{'='*80}")
+
+        # Load model for current checkpoint
+        model = load_model_from_checkpoint(checkpoint_path, args, device)
+
+        # Evaluate model
+        metrics, true_labels, predicted_labels, predicted_probs, inference_time, image_paths = evaluate_model(
+            model, test_loader, device, args.classification_mode, test_dataset
+        )
+
+        # Print summary for this fold
+        print_summary(dataset_stats, metrics, args.classification_mode)
+
+        # Store results for this checkpoint
+        fold_results = {
+            "checkpoint_path": checkpoint_path,
+            "fold_number": i + 1,
+            "dataset_statistics": dataset_stats,
+            "evaluation_metrics": metrics,
+            "configuration": {
+                "model_name": args.model_name,
+                "classification_mode": args.classification_mode,
+                "test_csv": args.test_csv,
+                "img_dir": args.img_dir,
+                "checkpoint": checkpoint_path,
+                "batch_size": args.batch_size,
+                "resize_size": args.resize_size,
+                "mci_subtype_filter": mci_subtype_filter,
+                "device": str(device),
+            },
+            "predictions": {
+                "true_labels": true_labels.tolist(),
+                "predicted_labels": predicted_labels.tolist(),
+                "predicted_probabilities": predicted_probs.tolist(),
+                "image_paths": image_paths,
+            }
+        }
+        all_results.append(fold_results)
+
+        # Save individual fold results if multiple checkpoints
+        if len(checkpoint_paths) > 1:
+            fold_dir = os.path.join(args.output_dir, f"fold_{i+1}")
+            os.makedirs(fold_dir, exist_ok=True)
+
+            # Save individual fold results
+            fold_results_path = os.path.join(fold_dir, "evaluation_results.json")
+            save_results(fold_results, fold_results_path)
+
+            # Save detailed predictions for this fold
+            predictions_csv_path = os.path.join(fold_dir, "predictions_detailed.csv")
+            save_predictions_csv(
+                image_paths, true_labels, predicted_labels, predicted_probs,
+                args.classification_mode, predictions_csv_path
+            )
+
+            # Generate per-fold visualizations
+            if args.classification_mode == "CN_AD":
+                class_names = ["CN", "AD"]
+            else:
+                class_names = ["CN", "MCI", "AD"]
+
+            # Confusion matrix (raw)
+            cm_path_fold = os.path.join(fold_dir, "confusion_matrix.png")
+            cm_fig_fold = plot_confusion_matrix(
+                y_true=true_labels,
+                y_pred=predicted_labels,
+                class_names=class_names,
+                normalize=False,
+                save_path=cm_path_fold,
+                title=f"Fold {i+1} Confusion Matrix"
+            )
+            plt.close(cm_fig_fold)
+
+            # Confusion matrix (normalized)
+            cm_norm_path_fold = os.path.join(fold_dir, "confusion_matrix_normalized.png")
+            cm_norm_fig_fold = plot_confusion_matrix(
+                y_true=true_labels,
+                y_pred=predicted_labels,
+                class_names=class_names,
+                normalize=True,
+                save_path=cm_norm_path_fold,
+                title=f"Fold {i+1} Confusion Matrix (Normalized)"
+            )
+            plt.close(cm_norm_fig_fold)
+
+            # ROC curves
+            roc_path_fold = os.path.join(fold_dir, "roc_curves.png")
+            plot_roc_curves(true_labels, predicted_probs, args.classification_mode, roc_path_fold)
+
+            # Confidence histogram
+            conf_hist_path_fold = os.path.join(fold_dir, "confidence_histogram.png")
+            plot_confidence_histogram(
+                predicted_probs, predicted_labels, true_labels,
+                args.classification_mode, conf_hist_path_fold
+            )
+
+        # Clean up model to free memory
+        del model
+        torch.cuda.empty_cache()
+        gc.collect()
+
+    # Handle single vs multiple checkpoint results
+    if len(checkpoint_paths) == 1:
+        # Single checkpoint - use existing logic
+        results = all_results[0]
+        metrics = results['evaluation_metrics']
+        true_labels = np.array(results['predictions']['true_labels'])
+        predicted_labels = np.array(results['predictions']['predicted_labels'])
+        predicted_probs = np.array(results['predictions']['predicted_probabilities'])
+
+        # Generate class names
+        if args.classification_mode == "CN_AD":
+            class_names = ["CN", "AD"]
+        else:
+            class_names = ["CN", "MCI", "AD"]
+
+        # Generate confusion matrix
+        cm_path = os.path.join(args.output_dir, "confusion_matrix.png")
+        cm_fig = plot_confusion_matrix(
+            y_true=true_labels,
+            y_pred=predicted_labels,
+            class_names=class_names,
+            normalize=False,
+            save_path=cm_path,
+            title="Test Set Confusion Matrix"
+        )
+        plt.close(cm_fig)
+
+        # Generate normalized confusion matrix
+        cm_norm_path = os.path.join(args.output_dir, "confusion_matrix_normalized.png")
+        cm_norm_fig = plot_confusion_matrix(
+            y_true=true_labels,
+            y_pred=predicted_labels,
+            class_names=class_names,
+            normalize=True,
+            save_path=cm_norm_path,
+            title="Test Set Confusion Matrix (Normalized)"
+        )
+        plt.close(cm_norm_fig)
+
+        # Generate ROC curves
+        roc_path = os.path.join(args.output_dir, "roc_curves.png")
+        plot_roc_curves(true_labels, predicted_probs, args.classification_mode, roc_path)
+
+        # Generate confidence histogram
+        conf_path = os.path.join(args.output_dir, "confidence_histogram.png")
+        plot_confidence_histogram(
+            predicted_probs, predicted_labels, true_labels,
+            args.classification_mode, conf_path
+        )
+
+        # Save detailed predictions to CSV
+        predictions_csv_path = os.path.join(args.output_dir, "predictions_detailed.csv")
+        save_predictions_csv(
+            image_paths, true_labels, predicted_labels, predicted_probs,
+            args.classification_mode, predictions_csv_path
+        )
+
+        # Save results
+        results_path = os.path.join(args.output_dir, "evaluation_results.json")
+        save_results(results, results_path)
+
+        # Save detailed classification report
+        report_path = os.path.join(args.output_dir, "classification_report.txt")
+        with open(report_path, 'w') as f:
+            f.write("ADNI Model Evaluation Report\n")
+            f.write("="*50 + "\n\n")
+            f.write(f"Model: {args.model_name}\n")
+            f.write(f"Classification Mode: {args.classification_mode}\n")
+            f.write(f"Test Dataset: {args.test_csv}\n")
+            f.write(f"Images Directory: {args.img_dir}\n")
+            f.write(f"Checkpoint: {checkpoint_paths[0]}\n")
+            f.write(f"Resize Size: {args.resize_size}\n")
+            if mci_subtype_filter:
+                f.write(f"MCI Subtype Filter: {mci_subtype_filter}\n")
+            f.write("\n")
+
+            f.write("Dataset Statistics:\n")
+            f.write("-"*20 + "\n")
+            for key, value in dataset_stats.items():
+                f.write(f"{key}: {value}\n")
+            f.write("\n")
+
+            f.write("Classification Report:\n")
+            f.write("-"*20 + "\n")
+            f.write(classification_report(true_labels, predicted_labels, target_names=class_names))
+            f.write("\n")
+
+            f.write("Additional Metrics:\n")
+            f.write("-"*20 + "\n")
+            f.write(f"Overall Accuracy: {metrics['accuracy']:.4f}\n")
+            if metrics['auc_scores']:
+                for auc_name, auc_value in metrics['auc_scores'].items():
+                    f.write(f"AUC {auc_name}: {auc_value:.4f}\n")
+            f.write(f"Total Inference Time: {metrics['total_inference_time']:.4f} seconds\n")
+            f.write(f"Average Time per Sample: {metrics['avg_inference_time_per_sample']:.6f} seconds\n")
+
+        print(f"\nEvaluation completed! Results saved to: {args.output_dir}")
+        print(f"Generated files:")
+        print(f"  - evaluation_results.json")
+        print(f"  - classification_report.txt")
+        print(f"  - predictions_detailed.csv")
+        print(f"  - confusion_matrix.png")
+        print(f"  - confusion_matrix_normalized.png")
+        print(f"  - roc_curves.png")
+        print(f"  - confidence_histogram.png")
+
+    else:
+        # Multiple checkpoints - Cross-validation analysis
+        print(f"\n{'='*80}")
+        print("CROSS-VALIDATION ANALYSIS")
+        print(f"{'='*80}")
+
+        # Aggregate results across all folds
+        aggregated_results = aggregate_cv_results(all_results)
+
+        # Print comprehensive summary table
+        print_cv_summary_table(aggregated_results)
+
+        # Save aggregated results
+        cv_summary_path = os.path.join(args.output_dir, "cv_summary.json")
+        save_cv_summary(aggregated_results, cv_summary_path)
+
+        # Save summary table as CSV
+        cv_summary_csv_path = os.path.join(args.output_dir, "cv_summary_table.csv")
+        save_cv_summary_table(aggregated_results, cv_summary_csv_path)
+
+        # Save detailed cross-validation report
+        cv_report_path = os.path.join(args.output_dir, "cv_report.txt")
+        with open(cv_report_path, 'w') as f:
+            f.write("ADNI Cross-Validation Evaluation Report\n")
+            f.write("="*50 + "\n\n")
+            f.write(f"Model: {args.model_name}\n")
+            f.write(f"Classification Mode: {args.classification_mode}\n")
+            f.write(f"Test Dataset: {args.test_csv}\n")
+            f.write(f"Images Directory: {args.img_dir}\n")
+            f.write(f"Number of Folds: {len(checkpoint_paths)}\n")
+            f.write(f"Checkpoints:\n")
+            for i, checkpoint in enumerate(checkpoint_paths):
+                f.write(f"  Fold {i+1}: {checkpoint}\n")
+            f.write(f"Resize Size: {args.resize_size}\n")
+            if mci_subtype_filter:
+                f.write(f"MCI Subtype Filter: {mci_subtype_filter}\n")
+            f.write("\n")
+
+            f.write("Dataset Statistics:\n")
+            f.write("-"*20 + "\n")
+            for key, value in dataset_stats.items():
+                f.write(f"{key}: {value}\n")
+            f.write("\n")
+
+            # Summary statistics
+            summary = aggregated_results['summary_statistics']
+            f.write("Cross-Validation Summary:\n")
+            f.write("-"*30 + "\n")
+            key_metrics = ["accuracy", "f1_macro", "f1_weighted", "precision_macro", "recall_macro"]
+            for metric in key_metrics:
+                if metric in summary:
+                    stats = summary[metric]
+                    f.write(f"{metric.replace('_', ' ').title()}: {stats['mean']:.4f} ± {stats['std']:.4f} "
+                           f"(range: {stats['min']:.4f} - {stats['max']:.4f})\n")
+            f.write("\n")
+
+            # Individual fold results
+            f.write("Individual Fold Results:\n")
+            f.write("-"*25 + "\n")
+            for fold_result in aggregated_results['fold_results']:
+                f.write(f"Fold {fold_result['fold']}:\n")
+                f.write(f"  Accuracy: {fold_result.get('accuracy', 0.0):.4f}\n")
+                f.write(f"  F1 Macro: {fold_result.get('f1_macro', 0.0):.4f}\n")
+                f.write(f"  F1 Weighted: {fold_result.get('f1_weighted', 0.0):.4f}\n")
+                f.write("\n")
+
+        # Create aggregated (ensemble) visualizations across folds
+        try:
+            # Determine class names
+            if args.classification_mode == "CN_AD":
+                class_names = ["CN", "AD"]
+            else:
+                class_names = ["CN", "MCI", "AD"]
+
+            # Collect predictions across folds
+            probs_list = [
+                np.array(fr["predictions"]["predicted_probabilities"]) for fr in all_results
+            ]
+            labels_list = [
+                np.array(fr["predictions"]["true_labels"]) for fr in all_results
+            ]
+
+            # Sanity check: ensure all true labels are identical across folds
+            true_labels_agg = labels_list[0]
+            for tl in labels_list[1:]:
+                if tl.shape != true_labels_agg.shape or not np.array_equal(tl, true_labels_agg):
+                    print("Warning: True labels differ across folds. Aggregated visualizations may be misaligned.")
+                    break
+
+            # Ensemble probabilities by averaging across folds
+            stacked_probs = np.stack(probs_list, axis=0)  # [F, N, C]
+            ens_probs = np.mean(stacked_probs, axis=0)    # [N, C]
+            ens_preds = np.argmax(ens_probs, axis=1)
+
+            # Paths for aggregated visuals
+            cm_path_cv = os.path.join(args.output_dir, "cv_confusion_matrix.png")
+            cm_norm_path_cv = os.path.join(args.output_dir, "cv_confusion_matrix_normalized.png")
+            roc_path_cv = os.path.join(args.output_dir, "cv_roc_curves.png")
+            conf_hist_path_cv = os.path.join(args.output_dir, "cv_confidence_histogram.png")
+
+            # Confusion matrices (aggregated via ensemble predictions)
+            cm_fig_cv = plot_confusion_matrix(
+                y_true=true_labels_agg,
+                y_pred=ens_preds,
+                class_names=class_names,
+                normalize=False,
+                save_path=cm_path_cv,
+                title="Cross-Validation Confusion Matrix (Ensemble)"
+            )
+            plt.close(cm_fig_cv)
+
+            cm_norm_fig_cv = plot_confusion_matrix(
+                y_true=true_labels_agg,
+                y_pred=ens_preds,
+                class_names=class_names,
+                normalize=True,
+                save_path=cm_norm_path_cv,
+                title="Cross-Validation Confusion Matrix (Ensemble, Normalized)"
+            )
+            plt.close(cm_norm_fig_cv)
+
+            # ROC curves (aggregated via ensemble probabilities)
+            plot_roc_curves(true_labels_agg, ens_probs, args.classification_mode, roc_path_cv)
+
+            # Confidence histogram (aggregated via ensemble)
+            plot_confidence_histogram(
+                ens_probs, ens_preds, true_labels_agg,
+                args.classification_mode, conf_hist_path_cv
+            )
+
+            # Save aggregated detailed predictions CSV (ensemble)
+            # Use image paths from the first fold when available
+            image_paths_first = all_results[0]["predictions"].get("image_paths", [f"image_{i}" for i in range(len(true_labels_agg))])
+            predictions_csv_path_cv = os.path.join(args.output_dir, "predictions_detailed_ensemble.csv")
+            save_predictions_csv(
+                image_paths_first,
+                true_labels_agg,
+                ens_preds,
+                ens_probs,
+                args.classification_mode,
+                predictions_csv_path_cv,
+            )
+        except Exception as e:
+            print(f"Error generating aggregated visualizations: {e}")
+
+        print(f"\nCross-validation evaluation completed! Results saved to: {args.output_dir}")
+        print(f"Generated files:")
+        print(f"  - cv_summary.json")
+        print(f"  - cv_summary_table.csv")
+        print(f"  - cv_report.txt")
+        print(f"  - cv_confusion_matrix.png")
+        print(f"  - cv_confusion_matrix_normalized.png")
+        print(f"  - cv_roc_curves.png")
+        print(f"  - cv_confidence_histogram.png")
+        print(f"  - predictions_detailed_ensemble.csv")
+        print(f"  - fold_1/ to fold_{len(checkpoint_paths)}/ (individual fold results)")
+
+    # Visualize predictions if requested (only for single checkpoint or last fold)
+    if args.visualize:
+        print("Generating prediction visualizations...")
+        # Reload the last model for visualization
+        model = load_model_from_checkpoint(checkpoint_paths[-1], args, device)
+        num_samples_viz = min(args.num_samples_viz, args.batch_size)
+        pred_viz_path = os.path.join(args.output_dir, "prediction_samples.png")
+        try:
+            visualize_predictions(
+                model, test_loader, device,
+                num_samples=num_samples_viz,
+                save_path=pred_viz_path
+            )
+            print(f"  - prediction_samples.png")
+        except Exception as e:
+            print(f"Error generating prediction visualizations: {e}")
+        finally:
+            del model
+            torch.cuda.empty_cache()
+
+    # Cleanup
+    del test_dataset, test_loader
+    torch.cuda.empty_cache()
+    gc.collect()
+
+
+if __name__ == "__main__":
+    main()
