@@ -36,7 +36,7 @@ def main():
     print(f"Columns: {list(df.columns)}")
 
     # Validate required columns
-    required = {"pt_index", "patient_id", "label"}
+    required = {"patient_id", "label"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"CSV missing required columns: {missing}")
