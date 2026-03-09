@@ -90,6 +90,8 @@ class TrainingConfig:
     focal_alpha: Optional[float] = None  # Alpha parameter for Focal Loss (typically 0.25-1.0)
     focal_gamma: float = 2.0  # Gamma parameter for Focal Loss (typically 0.5-5.0)
     checkpoint: CheckpointConfig = field(default_factory=CheckpointConfig)
+    early_stopping_patience: int = 0  # 0 = disabled; stop if val_acc doesn't improve for N val checks
+    early_stopping_min_delta: float = 0.0  # Minimum improvement to count as progress
 
 
 @dataclass
@@ -237,6 +239,8 @@ class Config:
                 "loss_type": self.training.loss_type,
                 "focal_alpha": self.training.focal_alpha,
                 "focal_gamma": self.training.focal_gamma,
+                "early_stopping_patience": self.training.early_stopping_patience,
+                "early_stopping_min_delta": self.training.early_stopping_min_delta,
                 "checkpoint": {
                     "save_best": self.training.checkpoint.save_best,
                     "save_latest": self.training.checkpoint.save_latest,

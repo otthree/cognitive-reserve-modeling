@@ -30,6 +30,8 @@ training:
   use_class_weights: true
   class_weight_type: "sqrt_inverse"
   loss_type: "cross_entropy"
+  early_stopping_patience: 20
+  early_stopping_min_delta: 0.0
   checkpoint:
     save_best: true
     save_latest: true

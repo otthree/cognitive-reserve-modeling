@@ -866,6 +866,12 @@ def main():
         visualize_batch(train_loader, num_samples=4,
                         save_path=os.path.join(config.training.output_dir, "train_samples.png"))
 
+    # Early stopping state
+    early_stopping_patience = config.training.early_stopping_patience
+    early_stopping_min_delta = config.training.early_stopping_min_delta
+    early_stopping_counter = 0
+    early_stop = False
+
     try:
         # Training loop
         for epoch in range(start_epoch, config.training.num_epochs):
@@ -960,6 +966,13 @@ def main():
                 is_best = val_acc > best_val_acc
                 if is_best:
                     best_val_acc = val_acc
+                    early_stopping_counter = 0
+                elif early_stopping_patience > 0:
+                    if val_acc < best_val_acc - early_stopping_min_delta:
+                        early_stopping_counter += 1
+                    if early_stopping_counter >= early_stopping_patience:
+                        print(f"\nEarly stopping triggered after {early_stopping_counter} val checks without improvement.")
+                        early_stop = True
 
                 # Save checkpoint
                 save_checkpoint(
@@ -1017,6 +1030,9 @@ def main():
                 # For non-plateau schedulers, we need to step even without validation
                 if scheduler is not None and not isinstance(scheduler, ReduceLROnPlateau):
                     scheduler.step()  # Step schedulers that don't depend on validation metrics
+
+            if early_stop:
+                break
 
         # Plot training history
         plot_training_history(
