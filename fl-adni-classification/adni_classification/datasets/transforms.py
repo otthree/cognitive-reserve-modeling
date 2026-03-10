@@ -8,6 +8,7 @@ from monai.transforms import (
     Compose,
     EnsureChannelFirstd,
     LoadImaged,
+    NormalizeIntensityd,
     Orientationd,
     Rand3DElasticd,
     RandAdjustContrastd,
@@ -418,15 +419,8 @@ def get_tensor_transforms(
         resize_size = tuple(resize_size)
 
     common_transforms = [
-        # Normalize intensity to [0, 1]
-        ScaleIntensityRanged(
-            keys=["image"],
-            a_min=0.0,
-            a_max=1.0,
-            b_min=0.0,
-            b_max=1.0,
-            clip=True,
-        ),
+        # Z-score normalization per sample (nonzero voxels only)
+        NormalizeIntensityd(keys=["image"], nonzero=True, channel_wise=True),
         Resized(
             keys=["image"],
             spatial_size=resize_size,
