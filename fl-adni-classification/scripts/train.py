@@ -1,5 +1,8 @@
 """Training script for ADNI classification."""
 
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning, module="importlib")
+
 import argparse
 import gc
 import os

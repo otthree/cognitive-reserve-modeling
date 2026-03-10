@@ -22,13 +22,12 @@ training:
   num_workers: 4
   output_dir: "outputs"
   seed: 42
-  gradient_accumulation_steps: 1
+  gradient_accumulation_steps: 2
   mixed_precision: true
   visualize: false
   lr_scheduler: "cosine"
-  val_epoch_freq: 5
-  use_class_weights: true
-  class_weight_type: "sqrt_inverse"
+  val_epoch_freq: 1
+  use_class_weights: false
   loss_type: "cross_entropy"
   early_stopping_patience: 20
   early_stopping_min_delta: 0.0
