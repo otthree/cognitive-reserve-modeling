@@ -4,6 +4,7 @@ data:
   img_dir: ""
   tensor_dir: "/workspace/pumpkinlab-storage-dhl/3D_tensors"
   dataset_type: "tensor_folder"
+  augmentation_strength: "mild"
   resize_size: [128, 128, 128]
   resize_mode: "trilinear"
   classification_mode: "CN_MCI_AD"

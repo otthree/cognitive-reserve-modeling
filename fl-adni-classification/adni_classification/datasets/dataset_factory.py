@@ -117,6 +117,7 @@ def get_transforms_from_config(
         spacing_size = config.get("spacing_size", (1, 1, 1))
         transform_device = config.get("transform_device")
         dataset_type = config.get("dataset_type", "")
+        augmentation_strength = config.get("augmentation_strength", "moderate")
     else:
         # It's a DataConfig-like object - use duck typing
         resize_size = getattr(config, "resize_size", (160, 160, 160))
@@ -125,6 +126,7 @@ def get_transforms_from_config(
         spacing_size = getattr(config, "spacing_size", (1, 1, 1))
         transform_device = getattr(config, "transform_device", None)
         dataset_type = getattr(config, "dataset_type", "")
+        augmentation_strength = getattr(config, "augmentation_strength", "moderate")
 
     # Get device from config if not explicitly provided
     if device is None and transform_device is not None:
@@ -137,6 +139,7 @@ def get_transforms_from_config(
             resize_size=resize_size,
             resize_mode=resize_mode,
             device=device,
+            augmentation_strength=augmentation_strength,
         )
 
     return get_transforms(
