@@ -65,19 +65,43 @@ def save_checkpoint(state, filepath):
     torch.save(state, filepath)
 
 
-def train_one_epoch(model, loader, criterion, optimizer, device, grad_clip):
+def mixup_batch(volumes, labels, alpha, num_classes, device):
+    """Apply mixup to a batch. Returns mixed volumes, labels_a, labels_b, lambda."""
+    lam = np.random.beta(alpha, alpha) if alpha > 0 else 1.0
+    batch_size = volumes.size(0)
+    index = torch.randperm(batch_size, device=device)
+    mixed_volumes = lam * volumes + (1 - lam) * volumes[index]
+    labels_a, labels_b = labels, labels[index]
+    return mixed_volumes, labels_a, labels_b, lam
+
+
+def mixup_criterion(criterion, outputs, labels_a, labels_b, lam):
+    return lam * criterion(outputs, labels_a) + (1 - lam) * criterion(outputs, labels_b)
+
+
+def train_one_epoch(model, loader, criterion, optimizer, device, grad_clip, mixup_alpha=0.0):
     model.train()
     running_loss = 0.0
     correct = 0
     total = 0
 
+    num_classes = next(p for p in model.parameters() if p.dim() == 2)
+    num_classes = model.classifier[-1].out_features
+
     for batch_idx, (volumes, labels) in enumerate(loader):
         volumes = volumes.to(device, non_blocking=True)
         labels = labels.to(device, non_blocking=True)
 
-        optimizer.zero_grad()
-        outputs = model(volumes)
-        loss = criterion(outputs, labels)
+        if mixup_alpha > 0:
+            volumes, labels_a, labels_b, lam = mixup_batch(volumes, labels, mixup_alpha, num_classes, device)
+            optimizer.zero_grad()
+            outputs = model(volumes)
+            loss = mixup_criterion(criterion, outputs, labels_a, labels_b, lam)
+        else:
+            optimizer.zero_grad()
+            outputs = model(volumes)
+            loss = criterion(outputs, labels)
+
         loss.backward()
 
         if grad_clip > 0:
@@ -377,6 +401,7 @@ def train(cfg, device):
         train_loss, train_acc = train_one_epoch(
             model, train_loader, criterion, optimizer, device,
             grad_clip=train_cfg["grad_clip"],
+            mixup_alpha=train_cfg.get("mixup_alpha", 0.0),
         )
 
         # Validate
