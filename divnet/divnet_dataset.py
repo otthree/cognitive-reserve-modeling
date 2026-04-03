@@ -1,0 +1,421 @@
+"""
+Dataset and data loading utilities for divNet training.
+
+Loads preprocessed .pt MRI volumes from:
+    {data_root}/3d-tensors/{CN,MCI,AD}/*.pt
+
+Each .pt file: float32 tensor of shape [1, 192, 192, 192]
+Labels: CN=0, MCI=1, AD=2
+"""
+
+import os
+import random
+from collections import Counter
+
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from sklearn.model_selection import train_test_split, StratifiedKFold
+
+
+CLASS_MAP = {"CN": 0, "MCI": 1, "AD": 2}
+
+
+def build_exclude_set(scan_csv_path, exclude_csv_path):
+    """
+    Build set of pt_index values to exclude based on CR detected patients.
+
+    Args:
+        scan_csv_path: Path to all_mri_scan_list.csv (pt_index -> patient_id mapping)
+        exclude_csv_path: Path to cr_detected_patients.csv (patients to exclude)
+
+    Returns:
+        Set of pt_index strings to exclude (e.g., {"0", "5", "123"})
+    """
+    scan_df = pd.read_csv(scan_csv_path)
+    exclude_df = pd.read_csv(exclude_csv_path)
+
+    exclude_iids = set(exclude_df["image_id"].astype(str).unique())
+    mask = scan_df["image_id"].astype(str).isin(exclude_iids)
+    exclude_indices = set(scan_df.loc[mask, "pt_index"].astype(str).values)
+
+    print(f"CR exclusion: {len(exclude_indices)} scans excluded (image-level)")
+    return exclude_indices
+
+
+def build_pid_map(scan_csv_path):
+    """Build mapping from pt_index (filename stem) to patient_id using CSV."""
+    df = pd.read_csv(scan_csv_path)
+    pid_map = {}
+    for _, row in df.iterrows():
+        pid_map[str(row["pt_index"])] = row["patient_id"]
+    print(f"PID map: {len(pid_map)} entries, {len(set(pid_map.values()))} unique patients")
+    return pid_map
+
+
+def collect_file_paths(data_root, exclude_indices=None):
+    """Scan data_root/3D_tensors/{CN,MCI,AD}/ and return (paths, labels)."""
+    tensor_dir = os.path.join(data_root, "3D_tensors")
+    paths = []
+    labels = []
+
+    for class_name, label in CLASS_MAP.items():
+        class_dir = os.path.join(tensor_dir, class_name)
+        if not os.path.isdir(class_dir):
+            print(f"Warning: directory not found: {class_dir}")
+            continue
+        for fname in sorted(os.listdir(class_dir)):
+            if fname.endswith(".pt"):
+                if exclude_indices is not None:
+                    stem = os.path.splitext(fname)[0]
+                    if stem in exclude_indices:
+                        continue
+                paths.append(os.path.join(class_dir, fname))
+                labels.append(label)
+
+    print(f"Found {len(paths)} total samples: {dict(Counter(labels))}")
+    return paths, labels
+
+
+def extract_patient_id(filepath):
+    """
+    Extract patient ID from filename for patient-level splitting.
+    Assumes format: sub-ADNI{PATIENT_ID}_ses-{session}_*.pt
+    Falls back to full filename if pattern does not match.
+    """
+    fname = os.path.basename(filepath)
+    # Try to extract subject-level ID (everything before _ses-)
+    if "_ses-" in fname:
+        return fname.split("_ses-")[0]
+    # Fallback: use the full filename stem as unique ID
+    return os.path.splitext(fname)[0]
+
+
+def patient_stratified_split(paths, labels, train_ratio, val_ratio, test_ratio, seed, pid_map=None):
+    """
+    Split data by patient ID (stratified) to prevent data leakage.
+    Returns (train_paths, train_labels), (val_paths, val_labels), (test_paths, test_labels).
+    """
+    # Group files by patient
+    patient_to_indices = {}
+    for idx, path in enumerate(paths):
+        if pid_map is not None:
+            stem = os.path.splitext(os.path.basename(path))[0]
+            pid = pid_map.get(stem, stem)
+        else:
+            pid = extract_patient_id(path)
+        if pid not in patient_to_indices:
+            patient_to_indices[pid] = []
+        patient_to_indices[pid].append(idx)
+
+    # Assign each patient a single label (majority label across their scans)
+    patient_ids = list(patient_to_indices.keys())
+    patient_labels = []
+    for pid in patient_ids:
+        pid_labels = [labels[i] for i in patient_to_indices[pid]]
+        patient_labels.append(max(set(pid_labels), key=pid_labels.count))
+
+    # First split: train vs (val + test)
+    val_test_ratio = val_ratio + test_ratio
+    train_pids, valtest_pids, train_plabels, valtest_plabels = train_test_split(
+        patient_ids, patient_labels,
+        test_size=val_test_ratio,
+        stratify=patient_labels,
+        random_state=seed,
+    )
+
+    # Second split: val vs test
+    relative_test_ratio = test_ratio / val_test_ratio
+    val_pids, test_pids, _, _ = train_test_split(
+        valtest_pids, valtest_plabels,
+        test_size=relative_test_ratio,
+        stratify=valtest_plabels,
+        random_state=seed,
+    )
+
+    # Convert patient IDs back to file indices
+    def pids_to_data(pids):
+        indices = []
+        for pid in pids:
+            indices.extend(patient_to_indices[pid])
+        return [paths[i] for i in indices], [labels[i] for i in indices]
+
+    train_data = pids_to_data(train_pids)
+    val_data = pids_to_data(val_pids)
+    test_data = pids_to_data(test_pids)
+
+    print(f"Split (patients): train={len(train_pids)}, val={len(val_pids)}, test={len(test_pids)}")
+    print(f"Split (scans):    train={len(train_data[0])}, val={len(val_data[0])}, test={len(test_data[0])}")
+
+    return train_data, val_data, test_data
+
+
+def patient_stratified_kfold(paths, labels, n_folds=5, seed=42, pid_map=None):
+    """
+    Split data into k folds by patient ID (stratified).
+    Returns list of k tuples: (train_paths, train_labels, val_paths, val_labels).
+    """
+    patient_to_indices = {}
+    for idx, path in enumerate(paths):
+        if pid_map is not None:
+            stem = os.path.splitext(os.path.basename(path))[0]
+            pid = pid_map.get(stem, stem)
+        else:
+            pid = extract_patient_id(path)
+        if pid not in patient_to_indices:
+            patient_to_indices[pid] = []
+        patient_to_indices[pid].append(idx)
+
+    patient_ids = np.array(list(patient_to_indices.keys()))
+    patient_labels = []
+    for pid in patient_ids:
+        pid_labels = [labels[i] for i in patient_to_indices[pid]]
+        patient_labels.append(max(set(pid_labels), key=pid_labels.count))
+    patient_labels = np.array(patient_labels)
+
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+    folds = []
+
+    for fold_idx, (train_pid_indices, val_pid_indices) in enumerate(skf.split(patient_ids, patient_labels)):
+        train_pids = patient_ids[train_pid_indices]
+        val_pids = patient_ids[val_pid_indices]
+
+        train_indices = []
+        for pid in train_pids:
+            train_indices.extend(patient_to_indices[pid])
+        val_indices = []
+        for pid in val_pids:
+            val_indices.extend(patient_to_indices[pid])
+
+        fold_data = (
+            [paths[i] for i in train_indices],
+            [labels[i] for i in train_indices],
+            [paths[i] for i in val_indices],
+            [labels[i] for i in val_indices],
+        )
+        folds.append(fold_data)
+
+        print(f"Fold {fold_idx}: train_patients={len(train_pids)}, val_patients={len(val_pids)}, "
+              f"train_scans={len(train_indices)}, val_scans={len(val_indices)}")
+
+    return folds
+
+
+def build_dataloaders_kfold(cfg, fold_idx, folds_data):
+    """
+    Build train/val DataLoaders for a single fold.
+    Returns train_loader, val_loader, class_weights.
+    """
+    data_cfg = cfg["data"]
+    train_paths, train_labels, val_paths, val_labels = folds_data[fold_idx]
+
+    train_dataset = ADNIDataset(train_paths, train_labels, augment=True)
+    val_dataset = ADNIDataset(val_paths, val_labels, augment=False)
+
+    train_sampler = make_weighted_sampler(train_labels)
+    class_weights = compute_class_weights(train_labels)
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=data_cfg["batch_size"],
+        sampler=train_sampler,
+        num_workers=data_cfg["num_workers"],
+        pin_memory=True,
+        drop_last=False,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=data_cfg["val_batch_size"],
+        shuffle=False,
+        num_workers=data_cfg["num_workers"],
+        pin_memory=True,
+    )
+
+    return train_loader, val_loader, class_weights
+
+
+class ADNIDataset(Dataset):
+    """
+    Dataset for loading preprocessed 3D MRI .pt files.
+
+    Args:
+        paths: list of .pt file paths
+        labels: list of integer labels (CN=0, MCI=1, AD=2)
+        augment: whether to apply training augmentation
+        noise_std: std of Gaussian noise augmentation
+        intensity_shift: max intensity shift magnitude
+    """
+
+    def __init__(self, paths, labels, augment=False, noise_std=0.01, intensity_shift=0.1,
+                 crop_size=176, input_size=192):
+        self.paths = paths
+        self.labels = labels
+        self.augment = augment
+        self.noise_std = noise_std
+        self.intensity_shift = intensity_shift
+        self.crop_size = crop_size
+        self.input_size = input_size
+
+    def __len__(self):
+        return len(self.paths)
+
+    def __getitem__(self, idx):
+        volume = torch.load(self.paths[idx], map_location="cpu", weights_only=True)
+
+        # Ensure shape [1, 192, 192, 192]
+        if volume.dim() == 3:
+            volume = volume.unsqueeze(0)
+
+        # Per-volume min-max normalization to [0, 1]
+        vmin = volume.min()
+        vmax = volume.max()
+        if vmax - vmin > 1e-8:
+            volume = (volume - vmin) / (vmax - vmin)
+        else:
+            volume = torch.zeros_like(volume)
+
+        # Training augmentation
+        if self.augment:
+            # Random crop: crop to crop_size³ then zero-pad back to input_size³
+            max_offset = self.input_size - self.crop_size
+            ox = random.randint(0, max_offset)
+            oy = random.randint(0, max_offset)
+            oz = random.randint(0, max_offset)
+            cropped = volume[:, ox:ox+self.crop_size, oy:oy+self.crop_size, oz:oz+self.crop_size]
+            volume = torch.zeros(1, self.input_size, self.input_size, self.input_size)
+            volume[:, ox:ox+self.crop_size, oy:oy+self.crop_size, oz:oz+self.crop_size] = cropped
+
+            # Random zoom: scale up then center crop back to input_size³
+            if random.random() > 0.5:
+                scale = random.uniform(1.05, 1.2)
+                scaled_size = int(self.input_size * scale)
+                volume = torch.nn.functional.interpolate(
+                    volume.unsqueeze(0), size=scaled_size, mode='trilinear', align_corners=False
+                ).squeeze(0)
+                start = (scaled_size - self.input_size) // 2
+                volume = volume[:, start:start+self.input_size, start:start+self.input_size, start:start+self.input_size]
+
+            # Random left-right flip
+            if random.random() > 0.5:
+                volume = torch.flip(volume, dims=[1])
+
+            # Random Gaussian noise
+            noise = torch.randn_like(volume) * self.noise_std
+            volume = volume + noise
+
+            # Random intensity shift
+            shift = random.uniform(-self.intensity_shift, self.intensity_shift)
+            volume = volume + shift
+
+            # Clamp back to valid range
+            volume = volume.clamp(0.0, 1.0)
+
+        label = self.labels[idx]
+        return volume, label
+
+
+def compute_class_weights(labels):
+    """Compute inverse-frequency class weights for CrossEntropyLoss."""
+    counts = Counter(labels)
+    total = len(labels)
+    num_classes = len(counts)
+    weights = torch.zeros(num_classes)
+    for cls, count in counts.items():
+        weights[cls] = total / (num_classes * count)
+    return weights
+
+
+def make_weighted_sampler(labels):
+    """Create WeightedRandomSampler for class-balanced training."""
+    counts = Counter(labels)
+    class_weight = {cls: 1.0 / count for cls, count in counts.items()}
+    sample_weights = [class_weight[label] for label in labels]
+    sampler = WeightedRandomSampler(
+        weights=sample_weights,
+        num_samples=len(sample_weights),
+        replacement=True,
+    )
+    return sampler
+
+
+def build_dataloaders(cfg):
+    """
+    Build train/val/test DataLoaders from config.
+
+    Args:
+        cfg: parsed YAML config dict
+
+    Returns:
+        train_loader, val_loader, test_loader, class_weights
+    """
+    data_cfg = cfg["data"]
+
+    # Build exclude set if configured
+    exclude_indices = None
+    scan_csv = data_cfg.get("scan_csv")
+    exclude_csv = data_cfg.get("exclude_csv")
+    if scan_csv and exclude_csv:
+        exclude_indices = build_exclude_set(scan_csv, exclude_csv)
+
+    # Build pid map if scan_csv is configured
+    pid_map = None
+    if scan_csv:
+        pid_map = build_pid_map(scan_csv)
+
+    # Collect all file paths
+    paths, labels = collect_file_paths(data_cfg["data_root"], exclude_indices=exclude_indices)
+
+    if len(paths) == 0:
+        raise RuntimeError(
+            f"No .pt files found in {data_cfg['data_root']}/3d-tensors/{{CN,MCI,AD}}/. "
+            "Check data_root in config."
+        )
+
+    # Patient-level stratified split
+    (train_paths, train_labels), (val_paths, val_labels), (test_paths, test_labels) = \
+        patient_stratified_split(
+            paths, labels,
+            train_ratio=data_cfg["train_ratio"],
+            val_ratio=data_cfg["val_ratio"],
+            test_ratio=data_cfg["test_ratio"],
+            seed=data_cfg["seed"],
+            pid_map=pid_map,
+        )
+
+    # Datasets
+    train_dataset = ADNIDataset(train_paths, train_labels, augment=True)
+    val_dataset = ADNIDataset(val_paths, val_labels, augment=False)
+    test_dataset = ADNIDataset(test_paths, test_labels, augment=False)
+
+    # Weighted sampler for training
+    train_sampler = make_weighted_sampler(train_labels)
+
+    # Class weights for loss
+    class_weights = compute_class_weights(train_labels)
+
+    # DataLoaders
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=data_cfg["batch_size"],
+        sampler=train_sampler,
+        num_workers=data_cfg["num_workers"],
+        pin_memory=True,
+        drop_last=False,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=data_cfg["val_batch_size"],
+        shuffle=False,
+        num_workers=data_cfg["num_workers"],
+        pin_memory=True,
+    )
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=data_cfg["val_batch_size"],
+        shuffle=False,
+        num_workers=data_cfg["num_workers"],
+        pin_memory=True,
+    )
+
+    return train_loader, val_loader, test_loader, class_weights
