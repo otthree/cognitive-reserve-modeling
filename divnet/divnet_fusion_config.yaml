@@ -1,0 +1,46 @@
+data:
+  data_root: /workspace/pumpkinlab-storage-dhl
+  batch_size: 2
+  val_batch_size: 1
+  num_workers: 4
+  train_ratio: 0.7
+  val_ratio: 0.15
+  test_ratio: 0.15
+  seed: 42
+  scan_csv: /workspace/cognitive-reserve-modeling/divnet/csv_splits_all_mri_scan_list.csv
+  # exclude_csv: /workspace/divnet/cr_detected_patients.csv
+
+tabular:
+  master_csv: /workspace/pumpkinlab-storage-dhl/ADNI_master_merge
+  d_12-17-2025.csv 
+
+model:
+  num_filters: 64
+  num_classes: 3
+  dropout1: 0.5
+  dropout2: 0.3
+  mlp_hidden: 32        # tabular MLP output dim; fused with 100-dim CNN features
+  tab_dropout: 0.3
+  pretrained_backbone: null   # optional: path to best_balanced_acc.pth from DivNet run
+
+training:
+  epochs: 100
+  optimizer: SGD
+  lr: 0.001
+  momentum: 0.9
+  weight_decay: 0.0005
+  lr_milestones: [30, 60, 80]
+  lr_gamma: 0.1
+  grad_clip: 1.0
+  mixup_alpha: 0.2
+  early_stopping_patience: 20
+
+wandb:
+  project: DivNetFusion AD Classification
+  enabled: true
+
+cross_validation:
+  k_folds: 5
+
+save:
+  checkpoint_dir: ./checkpoints/divnet_fusion
