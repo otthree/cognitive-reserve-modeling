@@ -8,8 +8,8 @@ import json
 # CONFIG
 # ============================================================
 
-WANDB_ENTITY  = "xfkwl00214xfkwl00214-university-of-washington"
-WANDB_PROJECT = "DivNet AD Classification"
+WANDB_ENTITY  = "dlee23-university-of-washington"
+WANDB_PROJECT = "DivNetFusion AD Classification"
 
 GSHEET_CREDENTIALS_PATH = "service_account.json" 
 GSHEET_SPREADSHEET_NAME = "results-hyperparam"  

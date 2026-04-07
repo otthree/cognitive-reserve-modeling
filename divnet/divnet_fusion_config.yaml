@@ -11,8 +11,7 @@ data:
   # exclude_csv: /workspace/divnet/cr_detected_patients.csv
 
 tabular:
-  master_csv: /workspace/pumpkinlab-storage-dhl/ADNI_master_merge
-  d_12-17-2025.csv 
+  master_csv: /workspace/pumpkinlab-storage-dhl/tabular/ADNI_master_merged_12-17-2025.csv
 
 model:
   num_filters: 64
