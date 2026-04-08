@@ -4,8 +4,8 @@ data:
   val_batch_size: 1
   num_workers: 4
   train_ratio: 0.7
-  val_ratio: 0.15
-  test_ratio: 0.15
+  val_ratio: 0.1
+  test_ratio: 0.2
   seed: 42
   scan_csv: /workspace/cognitive-reserve-modeling/divnet/csv_splits_all_mri_scan_list.csv
   # exclude_csv: /workspace/divnet/cr_detected_patients.csv

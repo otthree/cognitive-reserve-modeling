@@ -405,6 +405,43 @@ def make_weighted_sampler(labels):
 
 # ── DataLoader builders ───────────────────────────────────────────────────────
 
+def load_splits_from_csv(scan_csv_path: str, data_root: str, exclude_indices=None):
+    """
+    Load pre-assigned train/val/test splits from scan CSV 'split' column.
+    The CSV must have been prepared with make_splits.py beforehand.
+
+    Returns:
+        (train_paths, train_labels), (val_paths, val_labels), (test_paths, test_labels)
+    """
+    df = pd.read_csv(scan_csv_path)
+    if "split" not in df.columns:
+        raise RuntimeError(
+            "'split' column not found in scan CSV. "
+            "Run make_splits.py first to assign fixed splits."
+        )
+    split_map = {str(row["pt_index"]): row["split"] for _, row in df.iterrows()}
+
+    paths, labels = collect_file_paths(data_root, exclude_indices=exclude_indices)
+
+    train_paths, train_labels = [], []
+    val_paths,   val_labels   = [], []
+    test_paths,  test_labels  = [], []
+
+    for path, label in zip(paths, labels):
+        stem = os.path.splitext(os.path.basename(path))[0]
+        split = split_map.get(stem)
+        if split == "train":
+            train_paths.append(path); train_labels.append(label)
+        elif split == "val":
+            val_paths.append(path);   val_labels.append(label)
+        elif split == "test":
+            test_paths.append(path);  test_labels.append(label)
+
+    print(f"Loaded splits from CSV: train={len(train_paths)}, "
+          f"val={len(val_paths)}, test={len(test_paths)}")
+    return (train_paths, train_labels), (val_paths, val_labels), (test_paths, test_labels)
+
+
 def build_fusion_dataloaders(cfg: dict):
     """
     Build train/val/test DataLoaders for DivNetFusion.
@@ -421,26 +458,18 @@ def build_fusion_dataloaders(cfg: dict):
     if scan_csv and excl_csv:
         exclude_indices = build_exclude_set(scan_csv, excl_csv)
 
-    # PID map
-    pid_map = build_pid_map(scan_csv) if scan_csv else None
+    if not scan_csv:
+        raise RuntimeError("scan_csv must be set in config.")
 
-    # File paths + labels
-    paths, labels = collect_file_paths(data_cfg["data_root"], exclude_indices)
-    if not paths:
-        raise RuntimeError(
-            f"No .pt files found under {data_cfg['data_root']}/3D_tensors/{{CN,MCI,AD}}/. "
-            "Check data_root."
-        )
-
-    # Patient-stratified split
-    (tr_p, tr_l), (va_p, va_l), (te_p, te_l) = patient_stratified_split(
-        paths, labels,
-        train_ratio=data_cfg["train_ratio"],
-        val_ratio=data_cfg["val_ratio"],
-        test_ratio=data_cfg["test_ratio"],
-        seed=data_cfg["seed"],
-        pid_map=pid_map,
+    # Load fixed splits from scan CSV
+    (tr_p, tr_l), (va_p, va_l), (te_p, te_l) = load_splits_from_csv(
+        scan_csv, data_cfg["data_root"], exclude_indices=exclude_indices
     )
+
+    if not tr_p:
+        raise RuntimeError(
+            f"No training samples found. Check data_root and split column in scan CSV."
+        )
 
     # Build tabular lookup (with imputation report)
     master_csv = cfg["tabular"]["master_csv"]
