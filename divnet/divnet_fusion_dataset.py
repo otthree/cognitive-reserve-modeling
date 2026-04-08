@@ -483,7 +483,8 @@ def build_fusion_dataloaders(cfg: dict):
     print()
 
     # Datasets
-    train_ds = ADNIFusionDataset(tr_p, tr_l, tab_lookup, tab_mean, tab_std, augment=True)
+    train_ds = ADNIFusionDataset(tr_p, tr_l, tab_lookup, tab_mean, tab_std,
+                                 augment=data_cfg.get("augment", True))
     val_ds   = ADNIFusionDataset(va_p, va_l, tab_lookup, tab_mean, tab_std, augment=False)
     test_ds  = ADNIFusionDataset(te_p, te_l, tab_lookup, tab_mean, tab_std, augment=False)
 
