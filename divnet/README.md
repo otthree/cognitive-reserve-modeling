@@ -62,6 +62,9 @@ Standard train/val/test split training. Evaluates best model on test set at the 
 
 ```bash
 python3 divnet_train.py --config divnet_config.yaml
+
+
+python3 divnet_fusion_train.py --config divnet_fusion_config.yaml
 ```
 
 ### 5-Fold Cross-Validation
