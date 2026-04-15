@@ -3,7 +3,7 @@ DivNetFusion: Late fusion of DivNet (3D CNN) + tabular MLP for AD classification
 
 Architecture:
     CNN branch:  DivNet blocks → flatten(1728) → FC(512) → FC(100) → 100-dim features
-    Tab branch:  6 tab features → FC(64) → FC(32) → 32-dim features
+    Tab branch:  4 tab features → FC(64) → FC(32) → 32-dim features
     Fusion head: concat(132) → FC(num_classes)
 """
 
@@ -17,7 +17,7 @@ class DivNetFusion(nn.Module):
 
     Args:
         num_filters:     Number of CNN filters (default 64)
-        tab_input_dim:   Number of tabular input features (default 6)
+        tab_input_dim:   Number of tabular input features (default 4)
         mlp_hidden:      Hidden dim of tabular MLP output (default 32)
         num_classes:     Number of output classes (default 3)
         dropout1:        Dropout after first FC in CNN head (default 0.5)
@@ -28,7 +28,7 @@ class DivNetFusion(nn.Module):
     def __init__(
         self,
         num_filters: int = 64,
-        tab_input_dim: int = 6,
+        tab_input_dim: int = 4,
         mlp_hidden: int = 32,
         num_classes: int = 3,
         dropout1: float = 0.5,
@@ -130,7 +130,7 @@ class DivNetFusion(nn.Module):
         """
         Args:
             volume: [B, 1, 192, 192, 192] MRI tensor
-            tab:    [B, 6] normalized tabular features
+            tab:    [B, 4] normalized tabular features
 
         Returns:
             logits: [B, num_classes]
@@ -154,7 +154,7 @@ class DivNetFusion(nn.Module):
 if __name__ == "__main__":
     model = DivNetFusion()
     dummy_vol = torch.randn(2, 1, 192, 192, 192)
-    dummy_tab = torch.randn(2, 6)
+    dummy_tab = torch.randn(2, 4)
     out = model(dummy_vol, dummy_tab)
     print(f"Input (MRI):  {dummy_vol.shape}")
     print(f"Input (tab):  {dummy_tab.shape}")

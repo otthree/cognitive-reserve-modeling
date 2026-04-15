@@ -7,11 +7,9 @@ Combines:
 
 Tabular features (logical name -> actual CSV column):
   FDG_BL   -> FDG_bl
-  ADASQ4   -> ADASQ4
   VSBPDIA  -> VSBPDIA
   VSTEM    -> VSTEMP
   VSRESP   -> VSRESP
-  ADNI_VS  -> ADNI_VS
 
 Missing value handling:
   - VS columns (VSBPDIA, VSTEMP, VSRESP): -1 treated as NaN (sentinel value in ADNI)
@@ -37,11 +35,9 @@ CLASS_MAP = {"CN": 0, "MCI": 1, "AD": 2}
 # Maps logical feature name -> actual column name in master CSV
 FEATURE_COL_MAP = {
     "FDG_BL":  "FDG_bl",
-    "ADASQ4":  "ADASQ4",
     "VSBPDIA": "VSBPDIA",
     "VSTEM":   "VSTEMP",
     "VSRESP":  "VSRESP",
-    "ADNI_VS": "ADNI_VS",
 }
 
 # Columns that use -1 as a sentinel "missing" value in ADNI vitals tables

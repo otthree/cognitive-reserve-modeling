@@ -19,7 +19,7 @@ model:
   num_classes: 3
   dropout1: 0.5
   dropout2: 0.3
-  mlp_hidden: 32        # tabular MLP output dim; fused with 100-dim CNN features
+  mlp_hidden: 32        # tabular MLP output dim; fused with 100-dim CNN features (4 tabular features: FDG_bl, VSBPDIA, VSTEMP, VSRESP)
   tab_dropout: 0.3
   pretrained_backbone: null   # optional: path to best_balanced_acc.pth from DivNet run
 
