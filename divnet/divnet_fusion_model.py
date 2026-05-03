@@ -28,7 +28,7 @@ class DivNetFusion(nn.Module):
     def __init__(
         self,
         num_filters: int = 64,
-        tab_input_dim: int = 4,
+        tab_input_dim: int = 2,
         mlp_hidden: int = 32,
         num_classes: int = 3,
         dropout1: float = 0.5,

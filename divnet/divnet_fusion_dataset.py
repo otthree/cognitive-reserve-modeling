@@ -6,13 +6,11 @@ Combines:
   - 6 tabular features from ADNI_master_merged CSV, joined via scan CSV
 
 Tabular features (logical name -> actual CSV column):
-  FDG_BL   -> FDG_bl
-  VSBPDIA  -> VSBPDIA
   VSTEM    -> VSTEMP
   VSRESP   -> VSRESP
 
 Missing value handling:
-  - VS columns (VSBPDIA, VSTEMP, VSRESP): -1 treated as NaN (sentinel value in ADNI)
+  - VS columns (VSTEMP, VSRESP): -1 treated as NaN (sentinel value in ADNI)
   - All missing values imputed with per-diagnosis-group (CN/MCI/AD) median
   - Tabular features z-score normalized using training set statistics
 """
@@ -34,14 +32,12 @@ CLASS_MAP = {"CN": 0, "MCI": 1, "AD": 2}
 
 # Maps logical feature name -> actual column name in master CSV
 FEATURE_COL_MAP = {
-    "FDG_BL":  "FDG_bl",
-    "VSBPDIA": "VSBPDIA",
     "VSTEM":   "VSTEMP",
     "VSRESP":  "VSRESP",
 }
 
 # Columns that use -1 as a sentinel "missing" value in ADNI vitals tables
-VS_SENTINEL_COLS = {"VSBPDIA", "VSTEMP", "VSRESP"}
+VS_SENTINEL_COLS = {"VSTEMP", "VSRESP"}
 
 FEATURE_NAMES = list(FEATURE_COL_MAP.keys())   # canonical order
 ACTUAL_COLS   = list(FEATURE_COL_MAP.values())
