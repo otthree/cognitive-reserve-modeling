@@ -1,0 +1,35 @@
+data:
+  root: /workspace/pumpkinlab-storage-dhl
+  # CSV with columns: pt_index, image_path, patient_id, image_id, label, split
+  # Splits are pre-assigned at patient level (no leakage).
+  scan_csv: /workspace/cognitive-reserve-modeling/divnet/csv_splits_all_mri_scan_list.csv
+  # task: 'AD_vs_NC'  → CN(0) vs AD(1)
+  #       '3class'    → CN(0) vs MCI(1) vs AD(2)
+  task: 3class
+  # Input cube size (volumes resized from 192 → input_size via trilinear interpolation)
+  input_size: 96
+  batch_size: 4
+  val_batch_size: 2
+  num_workers: 4
+
+model:
+  # Channel multiplier. Stages: base_ch × [1→2→4→8→16]
+  # base_ch=64  → 1024-dim feature (GPU memory: ~12 GB for batch_size=4, input=96)
+  # base_ch=32  → 512-dim feature  (lighter option)
+  base_ch: 64
+  num_heads: 8      # SA block attention heads
+  dropout: 0.1
+
+training:
+  epochs: 100
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  # alpha: weight of clustering loss L_SC in joint loss (L_CE + alpha * L_SC)
+  alpha: 0.1
+  # Early stopping: stop if val_loss does not improve by min_delta for patience epochs
+  patience: 5
+  min_delta: 0.01
+
+output:
+  dir: ./runs
+  log_interval: 10   # log every N training batches
