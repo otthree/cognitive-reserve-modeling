@@ -102,7 +102,7 @@ training:
 
 ```bash
 cd /path/to/wei
-python train.py --config config.yaml
+python3 train.py --config config.yaml
 ```
 
 Checkpoints and training history are saved to `output.dir` (default: `./runs`):

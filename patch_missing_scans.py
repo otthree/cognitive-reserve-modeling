@@ -2,7 +2,7 @@
 Patch 21 missing scans that were skipped during original .pt conversion.
 
 Root cause: 2005 ADNI-1 scan filenames lack the S##### session ID,
-so regex (S\d+)_(I\d+) failed to match → 21 scans never converted.
+so regex (S[digits]+)_(I[digits]+) failed to match -> 21 scans never converted.
 
 This script:
   1. Identifies the 21 missing scans (master CSV vs scan CSV)
@@ -16,7 +16,21 @@ Usage (on the server):
 """
 
 import os
-import glob
+import subprocess
+import sys
+
+# Auto-install missing dependencies
+def _ensure(pkg, import_name=None):
+    import importlib
+    try:
+        importlib.import_module(import_name or pkg)
+    except ImportError:
+        print(f"Installing {pkg}...")
+        subprocess.check_call([sys.executable, '-m', 'pip', 'install', pkg, '-q'])
+
+_ensure('nibabel')
+_ensure('scipy')
+_ensure('tqdm')
 
 import numpy as np
 import nibabel as nib
@@ -32,10 +46,12 @@ MASTER_CSV = '/workspace/pumpkinlab-storage-dhl/tabular/ADNI_master_merged_12-17
 SCAN_CSV   = '/workspace/cognitive-reserve-modeling/divnet/csv_splits_all_mri_scan_list.csv'
 
 # Where the source .nii.gz files live (original 21 were never deleted because they were never matched)
-NII_DIR    = '/workspace/pumpkinlab-storage-dhl/all_brain_mni152_1mm_02_04_2026'
+GCS_NII_DIR = 'gs://pumpkinlab-storage-dhl/all_brain_mni152_1mm_02_04_2026'
 
 # Where existing .pt files live — new ones go into {PT_DIR}/{CN|MCI|AD}/{pt_index}.pt
 PT_DIR     = '/workspace/pumpkinlab-storage-dhl/3D_tensors'
+
+WORK_DIR   = '/tmp/patch_missing_scans'
 
 IMG_SIZE   = 192
 DEFAULT_SPLIT_FOR_NEW_PATIENT = 'train'   # only used for 011_S_0002 (no existing sessions)
@@ -71,16 +87,27 @@ def find_missing():
 
 
 # ---------------------------------------------------------------------------
-# Step 2: Find .nii.gz by I{image_id} in NII_DIR
+# Step 2: Find .nii.gz in GCS by I{image_id} wildcard, then download
 # ---------------------------------------------------------------------------
 
-def find_nii(image_id):
-    matches = glob.glob(os.path.join(NII_DIR, f'*I{image_id}*'))
-    if not matches:
+def find_and_download_nii(image_id):
+    """Search GCS for file matching *I{image_id}*, download to /tmp, return local path."""
+    result = subprocess.run(
+        ['gsutil', 'ls', f'{GCS_NII_DIR}/*I{image_id}*'],
+        capture_output=True, text=True
+    )
+    lines = [l.strip() for l in result.stdout.strip().splitlines() if l.strip()]
+    if not lines:
         return None
-    if len(matches) > 1:
-        print(f"  [WARN] Multiple matches for I{image_id}: {matches}")
-    return matches[0]
+    if len(lines) > 1:
+        print(f"  [WARN] Multiple matches for I{image_id}: {lines}")
+    gcs_uri = lines[0]
+
+    os.makedirs(WORK_DIR, exist_ok=True)
+    local_path = os.path.join(WORK_DIR, os.path.basename(gcs_uri))
+    subprocess.run(['gsutil', 'cp', gcs_uri, local_path], check=True,
+                   capture_output=True)
+    return local_path, gcs_uri
 
 
 # ---------------------------------------------------------------------------
@@ -137,12 +164,13 @@ def main():
         label    = row['label']
         pt_idx   = int(row['pt_index'])
 
-        # Find .nii.gz
-        nii_path = find_nii(iid)
-        if nii_path is None:
-            print(f"\n  [SKIP] I{iid} not found in {NII_DIR}")
+        # Find in GCS and download
+        result = find_and_download_nii(iid)
+        if result is None:
+            print(f"\n  [SKIP] I{iid} not found in GCS")
             not_found.append(iid)
             continue
+        nii_path, gcs_uri = result
 
         # Output path: {PT_DIR}/{label}/{pt_index}.pt
         out_dir = os.path.join(PT_DIR, label)
@@ -153,9 +181,12 @@ def main():
         tensor = process_nii(nii_path)
         torch.save(tensor, out_pt)
 
+        # Clean up downloaded nii
+        os.remove(nii_path)
+
         new_csv_rows.append({
             'pt_index':   pt_idx,
-            'image_path': nii_path,
+            'image_path': gcs_uri,
             'patient_id': row['patient_id'],
             'image_id':   iid,
             'label':      label,
